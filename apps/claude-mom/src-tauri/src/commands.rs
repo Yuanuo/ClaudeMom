@@ -231,16 +231,33 @@ pub async fn claude_local_action(action: String) -> CommandResult<Value> {
 }
 
 // ── 本地听写模型 ─────────────────────────────────────────────────────────
+//
+// 命令始终注册：带 dictation 的构建真正下载/识别，关掉时返回「不可用」，界面按
+// ClaudeStatus.dictationSupported 隐藏入口。这样 invoke_handler 不用按 feature 分支。
 
+#[cfg(feature = "dictation")]
 #[tauri::command]
 pub fn dictation_local_model_status() -> Value {
     claude_local::dictation::model_status()
 }
 
+#[cfg(not(feature = "dictation"))]
+#[tauri::command]
+pub fn dictation_local_model_status() -> Value {
+    json!({ "modelReady": false, "phase": "unavailable" })
+}
+
+#[cfg(feature = "dictation")]
 #[tauri::command]
 pub async fn download_dictation_local_model() -> CommandResult<Value> {
     match claude_local::dictation::prepare_model().await {
         Ok(state) => ok("本地 SenseVoice 模型下载并校验完成。", state),
         Err(error) => failed(&error.message, json!({})),
     }
+}
+
+#[cfg(not(feature = "dictation"))]
+#[tauri::command]
+pub async fn download_dictation_local_model() -> CommandResult<Value> {
+    failed("这个构建没有包含本地听写（用 MSVC 工具链构建才带 SenseVoice）。", json!({}))
 }

@@ -76,6 +76,8 @@ export type ClaudeStatus = {
   /** 内嵌的录制版本，新的在前。builtAt 是该版本前端的构建时间（秒）。 */
   templates?: Array<{ build: string; builtAt: number | null }>;
   nodeAvailable: boolean;
+  /** 这个构建是否带本地听写（GNU 工具链构建可以关掉）。 */
+  dictationSupported?: boolean;
   dictationReady: boolean;
   config: ClaudeConfig;
   models: string[];

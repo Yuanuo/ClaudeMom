@@ -76,6 +76,16 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 核心的 Node 测试：`cd crates/claude-local/runtime && node --test managed.test.mjs proxy.test.mjs`
 （需要本地测试证书：`scripts/gen-ca.sh`）。
 
+Windows 上只用 GNU 工具链时，本地听写依赖的 sherpa-onnx 没有可用的预编译库，用
+`--no-default-features` 关掉它（界面会隐藏语音输入，其它功能不变）：
+
+```bash
+npm run vite:build                                            # 先生成 dist（tauri::generate_context 需要）
+cargo test --workspace --no-default-features
+npm run vite:dev                                              # 另开一个终端
+cargo run --no-default-features --manifest-path src-tauri/Cargo.toml
+```
+
 ## 许可
 
 AGPL-3.0-only

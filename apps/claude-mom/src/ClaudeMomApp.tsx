@@ -643,16 +643,21 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
           label="界面汉化"
           onChange={(next) => onConfigure({ localization: next })}
         />
-        <Toggle
-          checked={config.voiceInput}
-          detail={config.threePMode
-            ? "本机版暂不支持：第三方模式下的听写只对接 Claude 的网关单点登录（SSO），本地服务还没实现"
-            : "Claude 输入框里的麦克风，用本机 SenseVoice 转写，音频不出本机。改完重新启动 Claude 生效。"}
-          disabled={disabled || config.threePMode}
-          label="语音输入"
-          onChange={onVoice}
-        />
-        {config.voiceInput && !config.threePMode && !status.dictationReady ? <VoiceModel onReady={() => onAction("prepare")} /> : null}
+        {/* GNU 工具链构建没编本地听写（sherpa-onnx 只有 MSVC 预编译库），整个入口隐藏。 */}
+        {status.dictationSupported === false ? null : (
+          <>
+            <Toggle
+              checked={config.voiceInput}
+              detail={config.threePMode
+                ? "本机版暂不支持：第三方模式下的听写只对接 Claude 的网关单点登录（SSO），本地服务还没实现"
+                : "Claude 输入框里的麦克风，用本机 SenseVoice 转写，音频不出本机。改完重新启动 Claude 生效。"}
+              disabled={disabled || config.threePMode}
+              label="语音输入"
+              onChange={onVoice}
+            />
+            {config.voiceInput && !config.threePMode && !status.dictationReady ? <VoiceModel onReady={() => onAction("prepare")} /> : null}
+          </>
+        )}
         <Toggle
           checked={config.importCliSessions ?? true}
           detail="启动 Claude 前，把终端、BaoCode 等命令行里建的会话加进左侧列表（已在列表里的、删过的不会重复加）。"

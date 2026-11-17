@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- 测试二进制也需要的清单：Tauri 的窗口代码导入了 comctl32 v6 才有的 TaskDialogIndirect，
+     没有这份清单时 Windows 会加载旧的 comctl32 v5，测试进程一启动就 STATUS_ENTRYPOINT_NOT_FOUND。 -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

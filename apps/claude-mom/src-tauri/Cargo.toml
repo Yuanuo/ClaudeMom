@@ -9,15 +9,23 @@ default-run = "claude-mom"
 
 [lib]
 name = "claude_mom_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面版只需要 rlib；staticlib / cdylib 是 Tauri 模板给移动端留的，Windows GNU 链接它们时
+# 会因导出序号超过 65535 直接失败（ld: export ordinal too large）。
+crate-type = ["rlib"]
 
 [[bin]]
 name = "claude-mom"
 path = "src/main.rs"
 
+[features]
+default = ["dictation"]
+# 本地听写（SenseVoice / sherpa-onnx）。Windows 上 sherpa-onnx 只提供 MSVC 预编译库，
+# 用 GNU 工具链本地开发时加 `--no-default-features` 关掉；界面会隐藏语音输入。
+dictation = ["claude-local/dictation"]
+
 [dependencies]
 anyhow.workspace = true
-claude-local = { path = "../../../crates/claude-local", features = ["dictation"] }
+claude-local = { path = "../../../crates/claude-local" }
 directories.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
@@ -30,6 +38,7 @@ tokio.workspace = true
 uuid.workspace = true
 
 [build-dependencies]
+embed-resource = "3"
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]

@@ -125,6 +125,8 @@ pub struct ClaudeLocalStatus {
     /// 内嵌的录制版本，新的在前；设置里的 `template` 为空时用第一个。
     pub templates: Vec<TemplateVersion>,
     pub node_available: bool,
+    /// 这个构建是否编译了本地听写引擎（宿主可以用 `--no-default-features` 关掉）。
+    pub dictation_supported: bool,
     pub dictation_ready: bool,
     pub config: ClaudeLocalSettings,
     pub models: Vec<String>,
@@ -1666,6 +1668,7 @@ pub fn status() -> Result<ClaudeLocalStatus> {
         ca_trusted: trusted,
         templates: template_versions(),
         node_available: node_runtime().is_some(),
+        dictation_supported: cfg!(feature = "dictation"),
         dictation_ready,
         config,
         models,

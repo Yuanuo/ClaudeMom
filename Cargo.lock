@@ -514,6 +514,7 @@ dependencies = [
  "anyhow",
  "claude-local",
  "directories",
+ "embed-resource",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

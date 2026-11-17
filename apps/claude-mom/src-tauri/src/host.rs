@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "dictation")]
 use claude_local::dictation::EngineError;
 use claude_local::{ClaudeLocalSettings, Host, Upstream};
 use serde_json::{Map, Value};
@@ -85,6 +86,10 @@ impl Host for ClaudeMomHost {
             .unwrap_or_default();
         // ClaudeMom 只有完整功能模式。
         config.enabled = true;
+        // 没编译本地听写时界面不显示语音输入；顺手把存量设置里的开关关掉，免得启动时提示听写未就绪。
+        if !cfg!(feature = "dictation") {
+            config.voice_input = false;
+        }
         // 会话同步默认开：平时在普通 Claude / 3p 模式建的会话记录在 ~/.claude，完整功能模式用独立目录，
         // 不同步的话左侧列表里的会话全显示「在磁盘上未找到会话」。用户关掉过就尊重。
         if stored.as_ref().and_then(|value| value.get("sessionSync")).is_none() {
@@ -102,6 +107,9 @@ impl Host for ClaudeMomHost {
         let mut map = read_settings_map()?;
         let mut config = config.clone();
         config.enabled = true;
+        if !cfg!(feature = "dictation") {
+            config.voice_input = false;
+        }
         map.insert(SETTINGS_KEY.into(), serde_json::to_value(config)?);
         claude_local::fsutil::atomic_write(&settings_path(), &serde_json::to_vec_pretty(&Value::Object(map))?)
     }
@@ -118,10 +126,18 @@ impl Host for ClaudeMomHost {
         true
     }
 
+    #[cfg(feature = "dictation")]
     fn dictation_ready(&self, config: &ClaudeLocalSettings) -> bool {
         config.voice_input && claude_local::dictation::model_ready()
     }
 
+    /// 没编译本地听写时永远不算就绪；界面也不会显示语音输入。
+    #[cfg(not(feature = "dictation"))]
+    fn dictation_ready(&self, _config: &ClaudeLocalSettings) -> bool {
+        false
+    }
+
+    #[cfg(feature = "dictation")]
     fn prepare_dictation_service(&self) -> Result<()> {
         let availability: claude_local::dictation::server::Availability = Arc::new(|| {
             let config = ClaudeMomHost.load_config().map_err(|error| EngineError::new(500, format!("{error:#}")))?;
@@ -134,6 +150,11 @@ impl Host for ClaudeMomHost {
             Ok(())
         });
         claude_local::dictation::server::ensure_running(&state_dir(), availability).map(|_| ())
+    }
+
+    #[cfg(not(feature = "dictation"))]
+    fn prepare_dictation_service(&self) -> Result<()> {
+        Ok(())
     }
 
     fn diagnostic(&self, event: &str, detail: Value) {
