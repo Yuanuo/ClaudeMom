@@ -453,39 +453,85 @@ pub struct UpstreamModel {
     pub context_window: Option<u64>,
 }
 
-/// `GET {base}/v1/models`（Anthropic 格式，Magpie / Codex++ 网关都支持）。
-pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<UpstreamModel>> {
-    let base = base_url.trim().trim_end_matches('/');
-    let url = reqwest::Url::parse(&format!("{base}/v1/models"))
+/// 模型列表的候选地址，按顺序试：
+/// 1. Anthropic 风格 `{base}/v1/models`（Magpie / Codex++ 网关都支持）；
+/// 2. Base URL 以 `/anthropic` 结尾时（DeepSeek、Kimi 等），去掉这一段再试 OpenAI 风格的
+///    `/models`、`/v1/models`——这类地址只把 `/v1/messages` 兼容成 Anthropic 格式，
+///    模型列表仍由根地址的 OpenAI 兼容接口提供（DeepSeek 就是 `https://api.deepseek.com/models`）。
+fn model_list_urls(base_url: &str) -> Result<Vec<reqwest::Url>> {
+    let base = reqwest::Url::parse(base_url.trim())
         .with_context(|| format!("Base URL 不是有效地址：{base_url}"))?;
-    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1" | "[::1]"));
+    let path = base.path().trim_end_matches('/');
+    let mut urls = Vec::new();
+    let mut push = |path: &str| {
+        let mut url = base.clone();
+        url.set_path(path);
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    };
+    // Base URL 已经写到 /v1 时不要再拼一层。
+    if path.ends_with("/v1") {
+        push(&format!("{path}/models"));
+    } else {
+        push(&format!("{path}/v1/models"));
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("/anthropic") {
+        let root = &path[..path.len() - "/anthropic".len()];
+        push(&format!("{root}/models"));
+        push(&format!("{root}/v1/models"));
+    }
+    Ok(urls)
+}
+
+/// 先按 Anthropic 格式拉模型列表，不支持的上游再退回 OpenAI 兼容格式（见 [`model_list_urls`]）。
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<UpstreamModel>> {
+    let urls = model_list_urls(base_url)?;
     let mut client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
-    if loopback {
+    if matches!(urls.first().and_then(reqwest::Url::host_str), Some("127.0.0.1" | "localhost" | "::1" | "[::1]")) {
         // 本机网关不走系统代理，否则请求会被代理转发出去。
         client = client.no_proxy();
     }
-    let response = client
-        .build()?
-        .get(url)
-        .header("x-api-key", api_key.trim())
-        .bearer_auth(api_key.trim())
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .context("请求模型列表失败")?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let detail: String = body.chars().take(200).collect();
-        bail!("上游返回 {status}：{detail}");
+    let client = client.build()?;
+    let mut attempts = Vec::new();
+    for url in urls {
+        let response = client
+            .get(url.clone())
+            .header("x-api-key", api_key.trim())
+            .bearer_auth(api_key.trim())
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                attempts.push(format!("{url} 请求失败：{error}"));
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let detail: String = body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+            attempts.push(format!("{url} 返回 {status}：{detail}"));
+            continue;
+        }
+        match parse_models(&body) {
+            Ok(models) if !models.is_empty() => return Ok(models),
+            Ok(_) => attempts.push(format!("{url} 没有返回模型")),
+            Err(error) => attempts.push(format!("{url}：{error:#}")),
+        }
     }
-    parse_models(&body)
+    bail!("没有拉到模型列表（{}）", attempts.join("；"))
 }
 
 fn parse_models(body: &str) -> Result<Vec<UpstreamModel>> {
     let value: Value = serde_json::from_str(body).context("模型列表不是 JSON")?;
+    // Anthropic / Magpie / Codex++ 用 data；个别 OpenAI 兼容网关用 models。
     let entries = value
         .get("data")
+        .or_else(|| value.get("models"))
         .and_then(Value::as_array)
         .context("模型列表里没有 data 字段")?;
     let mut seen = BTreeMap::new();
@@ -499,8 +545,10 @@ fn parse_models(body: &str) -> Result<Vec<UpstreamModel>> {
         }
         models.push(UpstreamModel {
             id: id.to_string(),
+            // OpenAI 形状用 name，Anthropic 形状用 display_name。
             display_name: entry
                 .get("display_name")
+                .or_else(|| entry.get("name"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|name| !name.is_empty() && *name != id)
@@ -739,5 +787,42 @@ mod tests {
             ]
         );
         assert!(parse_models("{}").is_err());
+    }
+
+    #[test]
+    fn model_lists_parse_openai_shape_from_deepseek() {
+        let models = parse_models(
+            &json!({"object": "list", "data": [
+                {"id": "deepseek-flash", "object": "model", "owned_by": "deepseek", "name": "DeepSeek Flash", "context_window": 128_000},
+                {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(models[0].display_name.as_deref(), Some("DeepSeek Flash"));
+        assert_eq!(models[0].context_window, Some(128_000));
+        assert_eq!(models[1].display_name, None);
+    }
+
+    #[test]
+    fn anthropic_base_falls_back_to_the_root_openai_model_list() {
+        let urls = |base: &str| -> Vec<String> { model_list_urls(base).unwrap().iter().map(reqwest::Url::to_string).collect() };
+        // DeepSeek：先试 Anthropic 风格的 /v1/models，再试根地址的 OpenAI 风格列表。
+        assert_eq!(
+            urls("https://api.deepseek.com/anthropic"),
+            [
+                "https://api.deepseek.com/anthropic/v1/models",
+                "https://api.deepseek.com/models",
+                "https://api.deepseek.com/v1/models",
+            ]
+        );
+        // 不以 /anthropic 结尾的上游（Magpie、Codex++、普通代理）只试一条。
+        assert_eq!(urls("http://127.0.0.1:3425"), ["http://127.0.0.1:3425/v1/models"]);
+        assert_eq!(urls("http://127.0.0.1:58001/gw/claude"), ["http://127.0.0.1:58001/gw/claude/v1/models"]);
+        // Base URL 已经写到 /v1：不要再拼一层 /v1/v1/models。
+        assert_eq!(urls("https://api.example.com/v1"), ["https://api.example.com/v1/models"]);
+        // 大小写不敏感地识别 /anthropic 后缀，路径本身保留原样；结尾斜杠忽略。
+        assert_eq!(&urls("https://api.deepseek.com/Anthropic/")[1..], &urls("https://api.deepseek.com/anthropic")[1..]);
+        assert!(model_list_urls("not a url").is_err());
     }
 }
