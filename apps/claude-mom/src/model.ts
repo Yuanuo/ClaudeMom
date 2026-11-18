@@ -73,6 +73,8 @@ export type ClaudeStatus = {
   port?: number | null;
   caReady: boolean;
   caTrusted: boolean;
+  caMachineSupported: boolean;
+  caMachineTrusted: boolean;
   /** 内嵌的录制版本，新的在前。builtAt 是该版本前端的构建时间（秒）。 */
   templates?: Array<{ build: string; builtAt: number | null }>;
   nodeAvailable: boolean;

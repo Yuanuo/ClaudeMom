@@ -122,6 +122,8 @@ pub struct ClaudeLocalStatus {
     pub port: Option<u16>,
     pub ca_ready: bool,
     pub ca_trusted: bool,
+    pub ca_machine_supported: bool,
+    pub ca_machine_trusted: bool,
     /// 内嵌的录制版本，新的在前；设置里的 `template` 为空时用第一个。
     pub templates: Vec<TemplateVersion>,
     pub node_available: bool,
@@ -487,6 +489,10 @@ fn remove_gateway_libraries(sets: &[ProfileSet]) -> Result<()> {
     Ok(())
 }
 
+/// 1p + Cowork 时临时写入的 VM 出网配置：固定 id，带独立标记，只删自己写的。
+const EGRESS_CONFIG_ID: &str = "00000000-0000-4000-8000-636c61756465";
+const EGRESS_MANAGED_MARKER: &str = "claudeLocalManaged";
+
 /// Claude Desktop 的一组 profile 目录：data 放 1p 的 userData（claude_desktop_config.json、Cache、claude-code-sessions），
 /// mode 是写 deploymentMode 的 Claude 目录，three_p 是 3p 模式的 userData。macOS 上 data 与 mode 相同。
 struct ProfileSet {
@@ -581,6 +587,69 @@ fn switch_state_path(root: &Path) -> PathBuf {
     root.join(SWITCH_STATE_FILE)
 }
 
+fn is_managed_egress_config_library(library: &Path) -> bool {
+    let Ok(bytes) = fs::read(library.join("_meta.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .is_some_and(|meta| meta[EGRESS_MANAGED_MARKER].as_bool() == Some(true))
+}
+
+/// CoworkVMService（LocalSystem）不继承 Claude 的 `--proxy-server`。启动前
+/// 在 Claude-3p/configLibrary 写入只含 `egressProxyUrl` 的临时配置，让 Claude
+/// 把本地代理传给 VM。已有用户 configLibrary 时不覆盖，交给正常 1p 切换流程处理。
+fn apply_egress_proxy_config(sets: &[ProfileSet], port: u16) -> Result<()> {
+    let meta = serde_json::to_vec_pretty(&json!({
+        "appliedId": EGRESS_CONFIG_ID,
+        "entries": [{ "id": EGRESS_CONFIG_ID, "name": "ClaudeLocal" }],
+        EGRESS_MANAGED_MARKER: true,
+    }))?;
+    let entry = serde_json::to_vec_pretty(&json!({
+        "egressProxyUrl": format!("http://127.0.0.1:{port}"),
+    }))?;
+    for (idx, set) in sets.iter().enumerate() {
+        // 主集合必写；其余集合在父目录已存在时写入（覆盖 classic + MSIX 虚拟化路径）。
+        if idx > 0 && !set.three_p.exists() && !set.three_p.parent().is_some_and(Path::exists) {
+            continue;
+        }
+        let library = set.three_p.join("configLibrary");
+        if library.exists() && !is_managed_egress_config_library(&library) {
+            crate::host::diagnostic(
+                "claude_local.egress_config_library_present",
+                json!({ "path": library }),
+            );
+            continue;
+        }
+        let created = !library.exists();
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&library)
+                .with_context(|| format!("无法创建 {}", library.display()))?;
+            // 先写配置，最后写带标记的 meta：meta 是「写完了」的标志。
+            crate::fsutil::atomic_write(&library.join(format!("{EGRESS_CONFIG_ID}.json")), &entry)?;
+            crate::fsutil::atomic_write(&library.join("_meta.json"), &meta)?;
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_dir_all(&library);
+        }
+        result?;
+    }
+    Ok(())
+}
+
+fn remove_managed_egress_config_libraries(sets: &[ProfileSet]) -> Result<()> {
+    for set in sets {
+        let library = set.three_p.join("configLibrary");
+        if is_managed_egress_config_library(&library) {
+            fs::remove_dir_all(&library)
+                .with_context(|| format!("无法清理临时 {}", library.display()))?;
+            let _ = fs::remove_dir(&set.three_p);
+        }
+    }
+    Ok(())
+}
+
 /// 处理「上次切换留下、状态文件却已经丢了」的 `configLibrary` 备份。
 ///
 /// 正常流程里备份由 `restore_real_profile` 按状态文件还原。状态文件丢了（崩溃、
@@ -614,9 +683,9 @@ fn recover_orphan_config_library(sets: &[ProfileSet], root: &Path) -> Result<Opt
         if !backup.exists() || tracked(&backup) {
             continue;
         }
-        if is_managed_gateway_library(&target) {
+        if is_managed_egress_config_library(&target) || is_managed_gateway_library(&target) {
             fs::remove_dir_all(&target)
-                .with_context(|| format!("无法清理 {}", target.display()))?;
+                .with_context(|| format!("无法清理临时 {}", target.display()))?;
         }
         if !target.exists() {
             fs::rename(&backup, &target)
@@ -739,6 +808,7 @@ fn apply_real_profile(sets: &[ProfileSet], root: &Path, mode: &str) -> Result<()
 }
 
 fn restore_real_profile(sets: &[ProfileSet], root: &Path) -> Result<()> {
+    remove_managed_egress_config_libraries(sets)?;
     // 本程序写的第三方模式配置先删掉，原来的 configLibrary 才能放回原处。
     remove_gateway_libraries(sets)?;
     // 状态文件丢了也得先把遗留备份收尾，否则切回 3p 之后它还会一直卡着下次启动。
@@ -1141,6 +1211,37 @@ fn ca_thumbprint(pem: &[u8]) -> Option<String> {
     Some(digest.iter().map(|byte| format!("{byte:02X}")).collect())
 }
 
+#[cfg(windows)]
+fn ca_thumbprint_from_root(root: &Path) -> Option<String> {
+    fs::read(root.join("ca/ca.pem"))
+        .ok()
+        .and_then(|pem| ca_thumbprint(&pem))
+}
+
+#[cfg(windows)]
+fn ca_trusted_user(root: &Path) -> bool {
+    let Some(thumbprint) = ca_thumbprint_from_root(root) else {
+        return false;
+    };
+    probe(
+        hidden_command("certutil").args(["-user", "-store", "Root", &thumbprint]),
+        Duration::from_secs(10),
+    )
+    .is_ok_and(|(success, _)| success)
+}
+
+#[cfg(windows)]
+fn ca_trusted_machine(root: &Path) -> bool {
+    let Some(thumbprint) = ca_thumbprint_from_root(root) else {
+        return false;
+    };
+    probe(
+        hidden_command("certutil").args(["-store", "Root", &thumbprint]),
+        Duration::from_secs(10),
+    )
+    .is_ok_and(|(success, _)| success)
+}
+
 fn ca_trusted(root: &Path) -> bool {
     if !ca_ready(root) {
         return false;
@@ -1158,20 +1259,31 @@ fn ca_trusted(root: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        let Some(thumbprint) = fs::read(root.join("ca/ca.pem"))
-            .ok()
-            .and_then(|pem| ca_thumbprint(&pem))
-        else {
-            return false;
-        };
-        return probe(
-            hidden_command("certutil").args(["-user", "-store", "Root", &thumbprint]),
-            Duration::from_secs(10),
-        )
-        .is_ok_and(|(success, _)| success);
+        return ca_trusted_user(root);
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     false
+}
+
+#[cfg(windows)]
+fn trust_ca_machine(root: &Path) -> Result<()> {
+    if ca_trusted_machine(root) {
+        return Ok(());
+    }
+    let cert = root.join("ca/ca.pem");
+    let cert_str = cert
+        .to_str()
+        .context("本地证书路径包含无效 UTF-8 字符")?;
+    crate::winproc::run_elevated_certutil(
+        &["-addstore", "Root", cert_str],
+        Duration::from_secs(120),
+    )
+    .context("Cowork 需要将本地证书安装到本机根证书，请在 UAC 弹窗中点击“是”后重试")?;
+    ensure!(
+        ca_trusted_machine(root),
+        "本机根证书信任未生效，请重新检查系统授权"
+    );
+    Ok(())
 }
 
 fn prepare_ca(root: &Path) -> Result<()> {
@@ -1333,18 +1445,24 @@ fn untrust_ca(root: &Path) -> Result<()> {
     // certutil -delstore 同样会弹确认框，给足用户点确认的时间。
     #[cfg(windows)]
     {
-        let Some(thumbprint) = fs::read(&cert)
-            .ok()
-            .and_then(|pem| ca_thumbprint(&pem))
-        else {
+        let Some(thumbprint) = ca_thumbprint_from_root(root) else {
             bail!("无法读取本地证书指纹，无法取消信任");
         };
-        let _ = probe(
-            hidden_command("certutil").args(["-user", "-delstore", "Root", &thumbprint]),
-            Duration::from_secs(120),
-        );
+        if ca_trusted_user(root) {
+            let _ = probe(
+                hidden_command("certutil").args(["-user", "-delstore", "Root", &thumbprint]),
+                Duration::from_secs(120),
+            );
+        }
+        if ca_trusted_machine(root) {
+            crate::winproc::run_elevated_certutil(
+                &["-delstore", "Root", &thumbprint],
+                Duration::from_secs(120),
+            )
+            .context("取消本机根证书需要管理员授权，请在 UAC 弹窗中点击“是”后重试")?;
+        }
         ensure!(
-            !ca_trusted(root),
+            !ca_trusted_user(root) && !ca_trusted_machine(root),
             "本地证书仍在信任列表中，请运行 certmgr.msc，在“受信任的根证书颁发机构”里删除 {}",
             host().ca_name()
         );
@@ -1636,6 +1754,10 @@ pub fn status() -> Result<ClaudeLocalStatus> {
     };
     let ready = ca_ready(&root);
     let trusted = ready && ca_trusted(&root);
+    #[cfg(windows)]
+    let machine_trusted = ready && ca_trusted_machine(&root);
+    #[cfg(not(windows))]
+    let machine_trusted = false;
     let dictation_ready = host().dictation_ready(&config);
     let warning = if let Some(warning) = runtime
         .as_ref()
@@ -1666,6 +1788,8 @@ pub fn status() -> Result<ClaudeLocalStatus> {
         port: runtime.map(|(port, _, _, _)| port),
         ca_ready: ready,
         ca_trusted: trusted,
+        ca_machine_supported: cfg!(windows),
+        ca_machine_trusted: machine_trusted,
         templates: template_versions(),
         node_available: node_runtime().is_some(),
         dictation_supported: cfg!(feature = "dictation"),
@@ -2096,6 +2220,7 @@ fn launch_original(
     upstream: Option<&Upstream>,
     share_home: bool,
     three_p: bool,
+    cowork: bool,
 ) -> Result<()> {
     let mut command = hidden_command(executable(source));
     for name in [
@@ -2129,7 +2254,14 @@ fn launch_original(
             return Ok(());
         }
         // 完整功能模式直接用真实 Claude profile（无 --user-data-dir），启动前切到 1p 并记录回滚信息。
-        apply_real_profile_one_p(&profile_sets(), root)?;
+        let sets = profile_sets();
+        apply_real_profile_one_p(&sets, root)?;
+        #[cfg(windows)]
+        if cowork {
+            apply_egress_proxy_config(&sets, port)?;
+        }
+        #[cfg(not(windows))]
+        let _ = cowork;
         apply_code_dir(&mut command, root, share_home, &home_dir().join(".claude"))?;
         command
             .args(local_launch_args(root, port, localization))
@@ -2176,6 +2308,14 @@ pub fn stop_backend() {
     let root = root_dir();
     reap_stale_proxy(&root);
     reap_orphan_proxies(&root);
+}
+
+/// 应用退出时停止本地代理并清理临时写入的 egressProxyUrl 策略。
+pub fn shutdown_on_exit() {
+    stop_backend();
+    if let Ok(_guard) = OPERATION.try_lock() {
+        let _ = remove_managed_egress_config_libraries(&profile_sets());
+    }
 }
 
 /// 先礼后兵地结束一个子进程。
@@ -2328,7 +2468,8 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
         "原版 Claude 本地模式目前仅支持 macOS 和 Windows"
     );
     ensure!(
-        ["launch", "stop", "trust", "untrust", "prepare", "sync_sessions"].contains(&action),
+        ["launch", "stop", "trust", "untrust", "trust_machine", "prepare", "sync_sessions"]
+            .contains(&action),
         "未知的 Claude 本地服务操作"
     );
     let _guard = OPERATION
@@ -2362,6 +2503,15 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
         "untrust" => {
             untrust_ca(&root)?;
             "本地证书已取消信任。".to_string()
+        }
+        "trust_machine" => {
+            install_assets(&root)?;
+            prepare_ca(&root)?;
+            #[cfg(windows)]
+            trust_ca_machine(&root)?;
+            #[cfg(not(windows))]
+            bail!("本机根证书信任仅支持 Windows");
+            "本机根证书已信任，Cowork 虚拟机可以使用本地代理。".to_string()
         }
         "prepare" => {
             install_assets(&root)?;
@@ -2472,6 +2622,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     Some(&upstream),
                     code_share_home(&config),
                     config.three_p_mode,
+                    config.cowork,
                 ) {
                     stop_backend();
                     let _ = restore_real_profile(&profile_sets(), &root);
@@ -3440,6 +3591,74 @@ server.listen(0,'127.0.0.1',()=>{
             );
         }
         assert!(!root.join(SWITCH_STATE_FILE).exists());
+    }
+
+    #[test]
+    fn egress_proxy_config_round_trips_with_existing_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let roaming = temp.path().join("roaming");
+        let local = temp.path().join("local");
+        fs::create_dir_all(local.join("Packages").join("Claude_abc")).unwrap();
+        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let root = temp.path().join("state");
+        for set in &sets {
+            fs::create_dir_all(set.three_p.parent().unwrap()).unwrap();
+        }
+        let user_lib = sets[0].three_p.join("configLibrary");
+        fs::create_dir_all(&user_lib).unwrap();
+        fs::write(user_lib.join("_meta.json"), r#"{"appliedId":"user"}"#).unwrap();
+
+        apply_real_profile_one_p(&sets, &root).unwrap();
+        apply_egress_proxy_config(&sets, 54702).unwrap();
+        for set in &sets {
+            let library = set.three_p.join("configLibrary");
+            assert!(is_managed_egress_config_library(&library));
+            let config: Value =
+                serde_json::from_slice(&fs::read(library.join(format!("{EGRESS_CONFIG_ID}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(config.as_object().unwrap().len(), 1, "只写 egressProxyUrl");
+            assert_eq!(config["egressProxyUrl"], json!("http://127.0.0.1:54702"));
+        }
+        // 更新端口时允许覆盖自己的临时配置。
+        apply_egress_proxy_config(&sets, 54703).unwrap();
+        let config: Value = serde_json::from_slice(
+            &fs::read(
+                sets[0]
+                    .three_p
+                    .join("configLibrary")
+                    .join(format!("{EGRESS_CONFIG_ID}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["egressProxyUrl"], json!("http://127.0.0.1:54703"));
+
+        restore_real_profile(&sets, &root).unwrap();
+        assert_eq!(
+            fs::read_to_string(user_lib.join("_meta.json")).unwrap(),
+            r#"{"appliedId":"user"}"#
+        );
+        assert!(!sets[1].three_p.join("configLibrary").exists());
+    }
+
+    #[test]
+    fn egress_proxy_config_works_without_existing_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let roaming = temp.path().join("roaming");
+        let local = temp.path().join("local");
+        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let root = temp.path().join("state");
+
+        apply_real_profile_one_p(&sets, &root).unwrap();
+        apply_egress_proxy_config(&sets, 54704).unwrap();
+        let library = sets[0].three_p.join("configLibrary");
+        assert!(is_managed_egress_config_library(&library));
+        assert!(library.join(format!("{EGRESS_CONFIG_ID}.json")).is_file());
+
+        restore_real_profile(&sets, &root).unwrap();
+        assert!(!library.exists(), "没有用户配置时退出后不应留下临时目录");
     }
 
     #[test]
