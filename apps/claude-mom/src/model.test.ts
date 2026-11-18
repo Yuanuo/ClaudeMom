@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, setupSteps, templateLabel, type ClaudeStatus } from "./model.ts";
+import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, normalizeRoutes, profileModelLabel, profileProblem, setupSteps, targetLabel, templateLabel, type ClaudeStatus, type ModelRoute } from "./model.ts";
 
 const status = (patch: Partial<ClaudeStatus> = {}): ClaudeStatus => ({
   supported: true, sourceApp: "", version: "1.0", claudeRunning: false, running: false, connected: false,
@@ -23,6 +23,44 @@ test("上游表单：要有效的 Base URL 和默认模型，不能写到 /v1/me
 
 test("模型列表去重，默认模型排第一", () => {
   assert.deepEqual(normalizeModels(["b", " a ", "b", ""], "a"), ["a", "b"]);
+});
+
+test("模型映射：同一角色只留最后一条；没填实际模型的行也保留", () => {
+  const route = (slot: string, id: string, target: string, name = "", supports1m = false): ModelRoute => ({ slot, id, target, name, supports1m });
+  assert.deepEqual(normalizeRoutes([
+    route("sonnet", " claude-sonnet-5-5 ", " deepseek-flash ", " Sonnet 5.5 ", true),
+    route("sonnet", "claude-sonnet-5", "deepseek-pro", "第二版"),
+    route("haiku", "claude-haiku-5-5", ""),
+    route("opus", "", "deepseek-pro"),
+  ]), [
+    { slot: "sonnet", id: "claude-sonnet-5", target: "deepseek-pro", name: "第二版", supports1m: false },
+    { slot: "haiku", id: "claude-haiku-5-5", target: "", name: "", supports1m: false },
+  ]);
+});
+
+test("模型映射校验：官方 ID 格式和重复；没填实际模型的行不参与", () => {
+  const profile = { ...emptyProfile(), baseUrl: "https://api.example.com", model: "deepseek-flash" };
+  const route = (slot: string, id: string, target: string): ModelRoute => ({ slot, id, target, name: "", supports1m: false });
+  assert.match(profileProblem({ ...profile, routes: [route("sonnet", "Claude-Sonnet-5-5", "deepseek-flash")] }) ?? "", /不对/);
+  assert.match(profileProblem({ ...profile, routes: [route("sonnet", "claude-sonnet-5-5", "a"), route("opus", "claude-sonnet-5-5", "b")] }) ?? "", /两个角色/);
+  assert.equal(profileProblem({ ...profile, routes: [route("sonnet", "claude-sonnet-5-5", "deepseek-flash")] }), null);
+  assert.equal(profileProblem({ ...profile, routes: [route("sonnet", "bad id", "")] }), null, "没填实际模型时先不拦");
+});
+
+test("角色映射显示：默认 Sonnet 和每个上游模型被哪些角色使用", () => {
+  const profile = {
+    ...emptyProfile(),
+    modelNames: { "deepseek-flash": "DeepSeek Flash", "deepseek-pro": "DeepSeek Pro" },
+    routes: [
+      { slot: "sonnet", id: "claude-sonnet-5-5", target: "deepseek-flash", name: "Sonnet 5.5", supports1m: true },
+      { slot: "haiku", id: "claude-haiku-5-5", target: "deepseek-flash", name: "Haiku 5.5", supports1m: false },
+      { slot: "opus", id: "claude-opus-5-5", target: "deepseek-pro", name: "Opus 5.5", supports1m: false },
+    ],
+  };
+  assert.equal(profileModelLabel(profile), "Sonnet 5.5 ← DeepSeek Flash");
+  assert.equal(targetLabel(profile, "deepseek-flash"), "DeepSeek Flash（Sonnet / Haiku）");
+  assert.equal(targetLabel(profile, "deepseek-pro"), "DeepSeek Pro（Opus）");
+  assert.equal(targetLabel(profile, "other"), "other");
 });
 
 test("状态文案：已连接、运行中、外部打开、未启动", () => {

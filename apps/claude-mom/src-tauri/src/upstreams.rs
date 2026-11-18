@@ -40,10 +40,39 @@ pub struct UpstreamProfile {
     pub context_window: Option<u64>,
     /// 模型显示名（上游 `/v1/models` 的 `display_name`）。Magpie 的路由组 id 不可读，全靠它。
     pub model_names: BTreeMap<String, String>,
+    /// 模型映射：上游模型 → 客户端看到的官方 Claude 身份。
+    pub routes: Vec<ModelRoute>,
     /// `manual` / `ccswitch` / `magpie` / `codexpp`。
     pub source: String,
     /// 来源里的标识（cc-switch 的供应商 id 等）；再次导入时据此更新而不是重复添加。
     pub source_id: String,
+}
+
+/// 一条模型映射：客户端看到的官方身份 → 实际请求的上游模型。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelRoute {
+    /// 表单里的角色槽：sonnet / opus / fable / haiku / custom。只用于界面分组。
+    pub slot: String,
+    /// 客户端看到的官方模型 ID。
+    pub id: String,
+    /// 实际转发给上游的模型 ID。旧版本这里叫 `model`，保留别名以便读回旧配置。
+    #[serde(alias = "model")]
+    pub target: String,
+    /// 菜单显示名；空 = 用上游显示名或官方 ID。
+    pub name: String,
+    /// 向客户端声明 1M 上下文。
+    pub supports_1m: bool,
+}
+
+/// 官方模型 ID 所属的角色（用于表单分组和 Haiku 快速模型判断）。
+fn route_slot(id: &str) -> &'static str {
+    for family in ["sonnet", "opus", "fable", "haiku"] {
+        if id.contains(&format!("-{family}-")) || id.ends_with(&format!("-{family}")) {
+            return family;
+        }
+    }
+    "custom"
 }
 
 impl UpstreamProfile {
@@ -57,25 +86,72 @@ impl UpstreamProfile {
                 models.push(candidate.to_string());
             }
         }
-        let small_model = Some(self.small_model.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+        // 客户端模型清单：映射表里每个填了实际模型的角色一条；没配映射时按上游池原样。
+        // 同一个上游模型可以同时出现在多个角色里（例如 Sonnet 和 Haiku 都用 deepseek-flash）。
+        let mut routes: Vec<claude_local::ModelRoute> = Vec::new();
+        for route in &self.routes {
+            let id = route.id.trim();
+            let target = route.target.trim();
+            if id.is_empty() || target.is_empty() || routes.iter().any(|known| known.id == id) {
+                continue;
+            }
+            if !models.iter().any(|known| known == target) {
+                models.push(target.to_string());
+            }
+            routes.push(claude_local::ModelRoute {
+                id: id.to_string(),
+                target: target.to_string(),
+                name: route.name.trim().to_string(),
+                supports_1m: route.supports_1m,
+            });
+        }
+        if routes.is_empty() {
+            for id in &models {
+                routes.push(claude_local::ModelRoute {
+                    id: id.clone(),
+                    target: id.clone(),
+                    name: String::new(),
+                    supports_1m: false,
+                });
+            }
+        }
+        // Haiku 角色存在时，标题生成等小任务也走它；否则用设置里的快速模型。
+        let haiku_target = self
+            .routes
+            .iter()
+            .find(|route| {
+                !route.target.trim().is_empty() && route_slot(route.id.trim()) == "haiku"
+            })
+            .map(|route| route.target.trim().to_string());
+        let small_model = haiku_target
+            .or_else(|| {
+                Some(self.small_model.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| model.clone());
         let window = self.context_window.filter(|window| *window > 0);
         let model_windows = window
             .map(|window| models.iter().map(|id| (id.clone(), window)).collect())
             .unwrap_or_default();
-        let model_names = models
+        let model_names = routes
             .iter()
-            .map(|id| {
-                let name = self
-                    .model_names
-                    .get(id)
-                    .map(|name| name.trim())
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| claude_local::friendly_model_name(id.rsplit('/').next().unwrap_or(id)));
-                (id.clone(), serde_json::json!({ "name": name, "description": self.name }))
+            .map(|route| {
+                let name = if route.name.is_empty() {
+                    self.model_names
+                        .get(&route.target)
+                        .map(|name| name.trim())
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            claude_local::friendly_model_name(
+                                route.target.rsplit('/').next().unwrap_or(&route.target),
+                            )
+                        })
+                } else {
+                    route.name.clone()
+                };
+                (route.id.clone(), serde_json::json!({ "name": name, "description": self.name }))
             })
             .collect();
         Upstream {
@@ -88,6 +164,7 @@ impl UpstreamProfile {
             model_names,
             model_windows,
             default_window: window,
+            routes,
             extra_env: Vec::new(),
         }
     }
@@ -146,6 +223,10 @@ impl UpstreamBook {
                     if known.model.is_empty() {
                         known.model = profile.model;
                         known.small_model = profile.small_model;
+                    }
+                    // 用户还没配映射时，把来源里的映射带过来；已经配过的以用户为准。
+                    if known.routes.is_empty() && !profile.routes.is_empty() {
+                        known.routes = profile.routes.clone();
                     }
                     for model in profile.models {
                         if !known.models.contains(&model) {
@@ -281,7 +362,7 @@ pub fn cc_switch_profiles(db: &Path) -> Result<Vec<UpstreamProfile>> {
         }
         // 桌面版的供应商 id 可能和 Claude Code 的重名（cc-switch 按 id + 类别区分），加前缀免得互相覆盖。
         let source_id = if app_type == "claude" { id } else { format!("{app_type}:{id}") };
-        let Some(profile) = cc_switch_profile(&source_id, &name, &settings) else { continue };
+        let Some(profile) = cc_switch_profile(&source_id, &name, &settings, &meta) else { continue };
         if !profiles
             .iter()
             .any(|known| known.base_url == profile.base_url && known.api_key == profile.api_key)
@@ -305,7 +386,18 @@ fn api_format(meta: &str) -> String {
         .unwrap_or_else(|| "anthropic".into())
 }
 
-fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamProfile> {
+/// 角色在表单里的默认顺序。
+fn slot_order(slot: &str) -> u8 {
+    match slot {
+        "sonnet" => 0,
+        "opus" => 1,
+        "fable" => 2,
+        "haiku" => 3,
+        _ => 4,
+    }
+}
+
+fn cc_switch_profile(id: &str, name: &str, settings: &str, meta: &str) -> Option<UpstreamProfile> {
     let settings: Value = serde_json::from_str(settings).ok()?;
     let env = settings.get("env")?;
     let text = |key: &str| {
@@ -319,12 +411,62 @@ fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamPro
     let api_key = text("ANTHROPIC_AUTH_TOKEN")
         .or_else(|| text("ANTHROPIC_API_KEY"))
         .unwrap_or_default();
+    // 桌面版把「官方身份 → 供应商模型」的映射放在 meta.claudeDesktopModelRoutes，一并带过来。
+    let meta: Value = serde_json::from_str(meta).unwrap_or(Value::Null);
+    let mut routes: Vec<ModelRoute> = Vec::new();
+    if let Some(map) = meta.get("claudeDesktopModelRoutes").and_then(Value::as_object) {
+        for (official, entry) in map {
+            let Some(target) = entry
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !official.starts_with("claude-")
+                || routes.iter().any(|route| route.id == *official)
+            {
+                continue;
+            }
+            let label = entry
+                .get("labelOverride")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(official);
+            // 一行一个官方角色；同一个上游模型可以同时填多个角色。
+            routes.push(ModelRoute {
+                slot: route_slot(official).to_string(),
+                id: official.clone(),
+                target: target.to_string(),
+                name: label.to_string(),
+                supports_1m: entry.get("supports1m").and_then(Value::as_bool).unwrap_or(false),
+            });
+        }
+    }
+    routes.sort_by(|a, b| slot_order(&a.slot).cmp(&slot_order(&b.slot)).then_with(|| a.id.cmp(&b.id)));
     let model = text("ANTHROPIC_MODEL")
         .or_else(|| text("ANTHROPIC_DEFAULT_OPUS_MODEL"))
         .or_else(|| text("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+        // 默认模型优先落在 Sonnet 角色上，其次非 Haiku，避免一导入就把 Haiku 当成主模型。
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| route.slot == "sonnet")
+                .or_else(|| routes.iter().find(|route| route.slot != "haiku"))
+                .or_else(|| routes.first())
+                .map(|route| route.target.clone())
+        })
         .unwrap_or_default();
     let small_model = text("ANTHROPIC_DEFAULT_HAIKU_MODEL")
         .or_else(|| text("ANTHROPIC_SMALL_FAST_MODEL"))
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| route.slot == "haiku")
+                .map(|route| route.target.clone())
+        })
         .unwrap_or_default();
     let mut models = Vec::new();
     for key in [
@@ -341,6 +483,11 @@ fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamPro
             models.push(model);
         }
     }
+    for route in &routes {
+        if !models.contains(&route.target) {
+            models.push(route.target.clone());
+        }
+    }
     Some(UpstreamProfile {
         name: name.trim().to_string(),
         base_url,
@@ -348,6 +495,7 @@ fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamPro
         model,
         small_model,
         models,
+        routes,
         source: SOURCE_CC_SWITCH.into(),
         source_id: id.to_string(),
         ..UpstreamProfile::default()
@@ -613,6 +761,91 @@ mod tests {
         assert_eq!(profile.api_key, "new");
         assert_eq!(profile.name, "我的 Kimi");
         assert_eq!(profile.model, "kimi-k3-turbo");
+
+        // 来源里有映射、用户还没配过时自动带过来；配过之后以用户的为准。
+        let mut routed = imported("newest");
+        routed.routes = vec![ModelRoute {
+            slot: "sonnet".into(),
+            id: "claude-sonnet-5-5".into(),
+            target: "kimi-k3-turbo".into(),
+            name: "Sonnet 5.5".into(),
+            supports_1m: true,
+        }];
+        assert_eq!(book.merge_imported(vec![routed]), (0, 1));
+        assert_eq!(book.profiles[0].routes.len(), 1);
+        book.profiles[0].routes[0].name = "我的 Sonnet".into();
+        let mut overwrite = imported("newest2");
+        overwrite.routes = vec![ModelRoute {
+            slot: "opus".into(),
+            id: "claude-opus-5-5".into(),
+            target: "other".into(),
+            name: "Opus".into(),
+            supports_1m: false,
+        }];
+        book.merge_imported(vec![overwrite]);
+        assert_eq!(book.profiles[0].routes[0].name, "我的 Sonnet");
+        assert_eq!(book.profiles[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn model_routes_become_client_models_with_windows_and_names() {
+        let profile = UpstreamProfile {
+            model: "deepseek-flash".into(),
+            small_model: "deepseek-v4-pro".into(),
+            models: vec!["deepseek-flash".into(), "deepseek-v4-pro".into()],
+            context_window: Some(128_000),
+            model_names: BTreeMap::from([
+                ("deepseek-flash".into(), "DeepSeek Flash".into()),
+                ("deepseek-v4-pro".into(), "DeepSeek V4 Pro".into()),
+            ]),
+            routes: vec![
+                ModelRoute {
+                    slot: "sonnet".into(),
+                    id: "claude-sonnet-5-5".into(),
+                    target: "deepseek-flash".into(),
+                    name: "Sonnet 5.5".into(),
+                    supports_1m: true,
+                },
+                ModelRoute {
+                    slot: "opus".into(),
+                    id: "claude-opus-5-5".into(),
+                    target: "deepseek-v4-pro".into(),
+                    name: String::new(),
+                    supports_1m: false,
+                },
+                // 同一个上游模型可以同时填多个角色。
+                ModelRoute {
+                    slot: "haiku".into(),
+                    id: "claude-haiku-5-5".into(),
+                    target: "deepseek-flash".into(),
+                    name: "Haiku 5.5".into(),
+                    supports_1m: false,
+                },
+            ],
+            ..UpstreamProfile::default()
+        };
+        let upstream = profile.to_upstream();
+        assert_eq!(upstream.default_model, "deepseek-flash");
+        assert_eq!(upstream.routes.len(), 3);
+        assert_eq!(upstream.routes[0].id, "claude-sonnet-5-5");
+        assert_eq!(upstream.routes[0].target, "deepseek-flash");
+        assert_eq!(upstream.routes[0].name, "Sonnet 5.5");
+        assert!(upstream.routes[0].supports_1m);
+        assert_eq!(upstream.routes[1].name, "", "没填显示名时留给上游名字");
+        assert_eq!(upstream.routes[2].target, "deepseek-flash", "多个角色可指向同一个上游模型");
+        assert_eq!(upstream.small_model, "deepseek-flash", "Haiku 角色覆盖快速模型");
+        assert_eq!(upstream.model_names["claude-sonnet-5-5"]["name"], "Sonnet 5.5");
+        assert_eq!(upstream.model_names["claude-opus-5-5"]["name"], "DeepSeek V4 Pro");
+        assert_eq!(upstream.model_names["claude-haiku-5-5"]["name"], "Haiku 5.5");
+        assert_eq!(upstream.model_windows["deepseek-flash"], 128_000);
+
+        // 没映射的模型按上游 ID 原样（老配置行为不变）。
+        let plain = UpstreamProfile { model: "m".into(), models: vec!["m".into(), "n".into()], ..UpstreamProfile::default() };
+        let routes = plain.to_upstream().routes;
+        assert_eq!(
+            routes.iter().map(|route| (route.id.as_str(), route.target.as_str())).collect::<Vec<_>>(),
+            [("m", "m"), ("n", "n")]
+        );
     }
 
     #[test]
@@ -678,7 +911,15 @@ mod tests {
             "claude-desktop",
             "Kimi",
             json!({"env": {"ANTHROPIC_BASE_URL": "https://kimi.example/anthropic", "ANTHROPIC_AUTH_TOKEN": "k"}}),
-            json!({"claudeDesktopMode": "direct", "apiFormat": "anthropic"}),
+            json!({
+                "claudeDesktopMode": "direct",
+                "apiFormat": "anthropic",
+                "claudeDesktopModelRoutes": {
+                    "claude-sonnet-5": {"model": "kimi-k3", "labelOverride": "Kimi K3", "supports1m": true},
+                    "claude-opus-5": {"model": "kimi-k3", "labelOverride": "Kimi Opus"},
+                    "claude-haiku-5-5": {"model": "kimi-lite", "labelOverride": "Kimi Lite"}
+                }
+            }),
         );
         // 两边配了同一组地址和 Key：只收一次。
         insert(
@@ -695,6 +936,22 @@ mod tests {
         let kimi = &profiles[1];
         assert_eq!((kimi.name.as_str(), kimi.base_url.as_str()), ("Kimi", "https://kimi.example/anthropic"));
         assert_eq!(kimi.source_id, "claude-desktop:a");
+        // cc-switch 桌面版的映射表原样带过来：官方身份 + 供应商模型 + 显示名 + 1M。
+        assert_eq!(kimi.model, "kimi-k3");
+        assert_eq!(kimi.small_model, "kimi-lite");
+        assert_eq!(kimi.routes.len(), 3, "Sonnet / Opus / Haiku 三个角色都保留");
+        let sonnet = kimi.routes.iter().find(|route| route.id == "claude-sonnet-5").unwrap();
+        assert_eq!(
+            (sonnet.slot.as_str(), sonnet.target.as_str(), sonnet.name.as_str(), sonnet.supports_1m),
+            ("sonnet", "kimi-k3", "Kimi K3", true)
+        );
+        // 同一个上游模型可以同时填 Sonnet 和 Opus。
+        let opus = kimi.routes.iter().find(|route| route.id == "claude-opus-5").unwrap();
+        assert_eq!((opus.slot.as_str(), opus.target.as_str(), opus.name.as_str()), ("opus", "kimi-k3", "Kimi Opus"));
+        let haiku = kimi.routes.iter().find(|route| route.id == "claude-haiku-5-5").unwrap();
+        assert_eq!((haiku.slot.as_str(), haiku.target.as_str(), haiku.name.as_str()), ("haiku", "kimi-lite", "Kimi Lite"));
+        assert!(kimi.models.contains(&"kimi-k3".to_string()));
+        assert!(kimi.models.contains(&"kimi-lite".to_string()));
         let glm = &profiles[0];
         assert_eq!(glm.name, "GLM");
         assert_eq!(glm.api_key, "tok");

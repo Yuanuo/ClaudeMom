@@ -27,7 +27,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { clientModel, clientModels, createGatewayStreamParser, createStateStore, gatewayHttpError, gatewayModel, gatewayRequest, gatewayTarget, isPrivateFile, mergePoolModels, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -256,8 +256,8 @@ const ORG = {
   plan_display_name: plan.label,
   plan_display_label: plan.label,
   has_hosted_code_environments: false,
-  claude_ai_bootstrap_models_config: runtime.models.map((model) => ({
-    model, name: runtime.modelNames?.[model]?.name || model, description: runtime.modelNames?.[model]?.description || "", paprika_modes: [], thinking_modes: [],
+  claude_ai_bootstrap_models_config: clientModels(runtime).map((model) => ({
+    model, name: modelLabel(runtime, model).name, description: modelLabel(runtime, model).description, paprika_modes: [], thinking_modes: [],
     hard_limit: modelWindow(runtime, model),
     context_window: modelWindow(runtime, model),
   })),
@@ -483,7 +483,7 @@ function ensureConv(uuid) {
       turns: [],
       nextIndex: 0,
       leafMessageId: null,
-      model: runtime.model,
+      model: clientModel(runtime),
     });
     stateStore.changed();
   }
@@ -685,7 +685,7 @@ function localBootstrap() {
     memory_mode: "melange",
     classic_mode_available: false,
     melange_available: false,
-    claude_ai_available_models: { models: runtime.models.map((model) => ({ model_id: model, minimum_tier: "free" })) },
+    claude_ai_available_models: { models: clientModels(runtime).map((model) => ({ model_id: model, minimum_tier: "free" })) },
     personalized_greeting: null,
     hold_notice: null,
     served_copy: {},
@@ -830,7 +830,7 @@ function convToRest(c, { messages = false } = {}) {
     id: c.uuid,
     name: title,
     summary: title,
-    model: c.model || runtime.model,
+    model: c.model || clientModel(runtime),
     created_at: c.created_at,
     updated_at: c.updated_at,
     current_leaf_message_uuid: c.leafMessageId || c.current_leaf_message_uuid || null,
@@ -1682,12 +1682,86 @@ function serveDocShell(req, res, url) {
   up.end();
 }
 
+// 模型映射：上游返回的 model 要改回客户端请求时用的身份，否则客户端会把
+// 「实际服务的模型」记成供应商模型。只改 model / message.model 两处，其余字节不动。
+function rewriteModelIdentity(value, identity) {
+  if (value === null || typeof value !== "object") return value;
+  if (typeof value.model === "string") value.model = identity;
+  if (value.message !== null && typeof value.message === "object" && typeof value.message.model === "string") {
+    value.message.model = identity;
+  }
+  return value;
+}
+
+function rewriteSseModelLine(line, identity) {
+  const newline = line.endsWith("\r\n") ? "\r\n" : line.endsWith("\n") ? "\n" : "";
+  const content = newline ? line.slice(0, -newline.length) : line;
+  if (!content.startsWith("data:")) return line;
+  const payload = content.slice(5).trim();
+  if (!payload.startsWith("{")) return line;
+  try {
+    return `data: ${JSON.stringify(rewriteModelIdentity(JSON.parse(payload), identity))}${newline}`;
+  } catch {
+    return line;
+  }
+}
+
+/** 把上游响应边收边转发，同时把 model 身份改回 `identity`。 */
+function pipeGatewayWithIdentity(response, res, identity) {
+  const headers = { ...response.headers };
+  // 上游不该压缩（请求里已剥掉 accept-encoding）；万一压了就只能原样透传。
+  const encoding = String(headers["content-encoding"] || "").toLowerCase();
+  if (encoding && encoding !== "identity") {
+    res.writeHead(response.statusCode, response.headers);
+    response.pipe(res);
+    return;
+  }
+  delete headers["content-length"];
+  delete headers["transfer-encoding"];
+  res.writeHead(response.statusCode, headers);
+  if (/text\/event-stream/i.test(String(headers["content-type"] || ""))) {
+    let pending = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk) => {
+      pending += chunk;
+      let index;
+      while ((index = pending.indexOf("\n")) !== -1) {
+        res.write(rewriteSseModelLine(pending.slice(0, index + 1), identity));
+        pending = pending.slice(index + 1);
+      }
+    });
+    response.on("end", () => {
+      if (pending) res.write(rewriteSseModelLine(pending, identity));
+      res.end();
+    });
+    response.on("error", () => res.destroy());
+    return;
+  }
+  const chunks = [];
+  response.on("data", (chunk) => chunks.push(chunk));
+  response.on("end", () => {
+    let text = Buffer.concat(chunks).toString("utf8");
+    try { text = JSON.stringify(rewriteModelIdentity(JSON.parse(text), identity)); } catch {}
+    res.end(Buffer.from(text, "utf8"));
+  });
+  response.on("error", () => res.destroy());
+}
+
 function forwardGateway(req, res, requestPath, raw) {
   let body = raw;
+  // 客户端请求的是映射后的身份时，响应里的 model 也改回这个身份。
+  let identity = null;
   const requested = new URL(requestPath, "http://localhost");
   if (req.method === "POST" && requested.pathname === "/v1/messages") {
-    try { body = gatewayBody(runtime, raw); }
-    catch { return json(res, { error: "Invalid model request" }, 400); }
+    try {
+      const prepared = gatewayRequest(runtime, raw);
+      body = prepared.body;
+      const asked = prepared.requested;
+      if (asked && asked !== prepared.forwarded &&
+        (runtime.routes?.some((route) => route.id === asked) || /^(?:claude-)?haiku(?:-|$)/i.test(asked))) {
+        identity = asked;
+      }
+    } catch { return json(res, { error: "Invalid model request" }, 400); }
   }
   const target = gatewayTarget(runtime, requestPath);
   const headers = {
@@ -1699,8 +1773,12 @@ function forwardGateway(req, res, requestPath, raw) {
     hostname: target.hostname, port: target.port || (target.protocol === "https:" ? 443 : 80),
     path: target.pathname + target.search, method: req.method, headers, timeout: 300000,
   }, (response) => {
-    res.writeHead(response.statusCode, response.headers);
-    response.pipe(res);
+    if (!identity) {
+      res.writeHead(response.statusCode, response.headers);
+      response.pipe(res);
+      return;
+    }
+    pipeGatewayWithIdentity(response, res, identity);
   });
   up.on("timeout", () => up.destroy(new Error("gateway timeout")));
   up.on("error", () => {

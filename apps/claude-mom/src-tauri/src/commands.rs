@@ -46,6 +46,11 @@ pub struct ModelsPayload {
     models: Vec<UpstreamModel>,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct OfficialModelsPayload {
+    models: Vec<claude_local::OfficialModel>,
+}
+
 fn load() -> anyhow::Result<UpstreamBook> {
     claude_mom::load_book(&claude_mom::default_book_path())
 }
@@ -177,6 +182,16 @@ pub async fn claude_mom_fetch_models(base_url: String, api_key: String) -> Comma
         Ok(models) => ok(&format!("拉到 {} 个模型。", models.len()), ModelsPayload { models }),
         Err(error) => failed(&format!("{error:#}"), ModelsPayload::default()),
     }
+}
+
+/// 「模型映射」表单的官方模型候选：取自内嵌录制模板的模型清单（与客户端版本一致）。
+#[tauri::command]
+pub fn claude_mom_official_models() -> CommandResult<OfficialModelsPayload> {
+    let models = claude_local::official_models();
+    ok(
+        &format!("{} 个官方模型。", models.len()),
+        OfficialModelsPayload { models },
+    )
 }
 
 /// 原生听写开关：只改 Claude 的「原生听写」，转写用本机 SenseVoice。返回最新的 Claude 状态。

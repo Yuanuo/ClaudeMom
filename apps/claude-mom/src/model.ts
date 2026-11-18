@@ -7,6 +7,29 @@ export type CommandResult<T> = T & { status: CommandStatus; message: string };
 
 export type UpstreamSource = "manual" | "ccswitch" | "magpie" | "codexpp";
 
+/** 一条模型映射：官方角色 → 实际请求的上游模型。 */
+export type ModelRoute = {
+  /** 角色槽：sonnet / opus / fable / haiku / custom，只用于表单分组。 */
+  slot: string;
+  /** 客户端看到的官方模型 ID（例如 claude-sonnet-5-5）。 */
+  id: string;
+  /** 实际请求的上游模型 ID；空 = 这个角色不用。 */
+  target: string;
+  /** 选择器显示名；空 = 用官方/上游名字。 */
+  name: string;
+  /** 向客户端声明 1M 上下文。 */
+  supports1m: boolean;
+};
+
+/** 默认展示的四个官方模型角色（和 CC-Switch 的模型映射一致）。 */
+export type ModelSlot = { slot: string; label: string; fallbackId: string };
+export const MODEL_SLOTS: ModelSlot[] = [
+  { slot: "sonnet", label: "Sonnet", fallbackId: "claude-sonnet-5-5" },
+  { slot: "opus", label: "Opus", fallbackId: "claude-opus-5-5" },
+  { slot: "fable", label: "Fable", fallbackId: "claude-fable-5-2" },
+  { slot: "haiku", label: "Haiku", fallbackId: "claude-haiku-5-5" },
+];
+
 /** 一组上游（与 core `claude_mom::UpstreamProfile` 字段一致）。 */
 export type UpstreamProfile = {
   id: string;
@@ -19,6 +42,8 @@ export type UpstreamProfile = {
   contextWindow: number | null;
   /** 模型显示名（上游 `/v1/models` 的 display_name）。 */
   modelNames: Record<string, string>;
+  /** 模型映射；没有行 = 按上游模型原样显示。 */
+  routes: ModelRoute[];
   source: UpstreamSource | string;
   sourceId: string;
 };
@@ -27,9 +52,90 @@ export type UpstreamBook = { profiles: UpstreamProfile[]; activeId: string | nul
 
 export type UpstreamModel = { id: string; displayName: string | null; contextWindow: number | null };
 
+/** 官方模型候选（来自内嵌录制模板，和当前 Claude 版本一致）。 */
+export type OfficialModel = { id: string; name: string };
+
+/** 模板解析失败时的兜底候选；用户仍可手填任意官方 ID。 */
+export const FALLBACK_OFFICIAL_MODELS: OfficialModel[] = [
+  { id: "claude-fable-5-2", name: "Fable 5.2" },
+  { id: "claude-opus-5-5", name: "Opus 5.5" },
+  { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
+  { id: "claude-haiku-5-5", name: "Haiku 5.5" },
+  { id: "claude-fable-5-1", name: "Fable 5.1" },
+  { id: "claude-opus-5", name: "Opus 5" },
+  { id: "claude-sonnet-5", name: "Sonnet 5" },
+  { id: "claude-fable-5", name: "Fable 5" },
+  { id: "claude-opus-4-6", name: "Opus 4.6" },
+  { id: "claude-sonnet-4-6", name: "Sonnet 4.6" },
+  { id: "claude-opus-4-5", name: "Opus 4.5" },
+  { id: "claude-sonnet-4-5", name: "Sonnet 4.5" },
+  { id: "claude-haiku-4-5", name: "Haiku 4.5" },
+];
+
+/** 官方模型的默认显示名；不在候选里就用 ID 本身。 */
+export function officialName(official: OfficialModel[], id: string): string {
+  return official.find((model) => model.id === id)?.name || id;
+}
+
+/** 官方 ID 属于哪个角色家族。 */
+export function slotOf(id: string): string {
+  for (const family of ["sonnet", "opus", "fable", "haiku"]) {
+    if (id.includes(`-${family}-`) || id.endsWith(`-${family}`)) return family;
+  }
+  return "custom";
+}
+
+export function slotLabel(slot: string): string {
+  return MODEL_SLOTS.find((item) => item.slot === slot)?.label ?? (slot === "custom" ? "自定义" : slot);
+}
+
+/** 角色对应的最新官方 ID：候选里同一家族版本号最大的那个。 */
+export function defaultOfficialId(official: OfficialModel[], slot: string, fallback: string): string {
+  let best = "";
+  let bestScore = -1;
+  for (const model of official) {
+    if (slotOf(model.id) !== slot) continue;
+    const rest = model.id.startsWith(`claude-${slot}-`) ? model.id.slice(`claude-${slot}-`.length) : "";
+    const score = rest.split("-").reduce((acc, part) => acc * 100 + (Number.parseInt(part, 10) || 0), 0);
+    if (score > bestScore) {
+      best = model.id;
+      bestScore = score;
+    }
+  }
+  if (best) return best;
+  const known = official.find((model) => model.id.startsWith(`claude-${slot}`));
+  return known?.id ?? fallback;
+}
+
 /** 界面上显示的模型名：有显示名用显示名，否则用 id。 */
 export function modelLabel(profile: Pick<UpstreamProfile, "modelNames">, id: string): string {
   return profile.modelNames?.[id] || id;
+}
+
+/** 某个角色（slot）当前的映射行。 */
+export function routeForSlot(profile: Pick<UpstreamProfile, "routes">, slot: string): ModelRoute | undefined {
+  return profile.routes?.find((route) => (route.slot || slotOf(route.id)) === slot);
+}
+
+/** 实际生效的默认角色：优先 Sonnet，其次第一个有上游模型的行。 */
+export function defaultRoute(profile: Pick<UpstreamProfile, "routes">): ModelRoute | undefined {
+  const active = (profile.routes ?? []).filter((route) => route.id.trim() && route.target.trim());
+  return active.find((route) => (route.slot || slotOf(route.id)) === "sonnet") ?? active[0];
+}
+
+/** 侧边栏/标题栏的模型说明：「Sonnet 5.5 ← DeepSeek Flash」。 */
+export function profileModelLabel(profile: Pick<UpstreamProfile, "model" | "modelNames" | "routes">): string {
+  const route = defaultRoute(profile);
+  if (!route) return profile.model ? modelLabel(profile, profile.model) : "";
+  return `${route.name.trim() || route.id.trim()} ← ${modelLabel(profile, route.target)}`;
+}
+
+/** 默认模型下拉的说明：这个上游模型被填到了哪些角色。 */
+export function targetLabel(profile: Pick<UpstreamProfile, "modelNames" | "routes">, target: string): string {
+  const roles = [...new Set((profile.routes ?? [])
+    .filter((route) => route.target === target && route.id.trim())
+    .map((route) => slotLabel(route.slot || slotOf(route.id))))];
+  return roles.length ? `${modelLabel(profile, target)}（${roles.join(" / ")}）` : modelLabel(profile, target);
 }
 
 /** Claude 本地服务的设置（与 core `ClaudeLocalSettings` 一致，只列界面用到的）。 */
@@ -102,7 +208,7 @@ export const IMPORT_SOURCES: Array<{ id: UpstreamSource; label: string; detail: 
 ];
 
 export function emptyProfile(): UpstreamProfile {
-  return { id: "", name: "", baseUrl: "", apiKey: "", model: "", smallModel: "", models: [], contextWindow: null, modelNames: {}, source: "manual", sourceId: "" };
+  return { id: "", name: "", baseUrl: "", apiKey: "", model: "", smallModel: "", models: [], contextWindow: null, modelNames: {}, routes: [], source: "manual", sourceId: "" };
 }
 
 export function hostOf(url: string): string {
@@ -126,6 +232,18 @@ export function profileProblem(profile: UpstreamProfile): string | null {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "Base URL 要以 http:// 或 https:// 开头";
   if (/\/v1\/messages\/?$/.test(parsed.pathname)) return "Base URL 只写到根地址，不要带 /v1/messages";
   if (!profile.model.trim()) return "选一个默认模型";
+  // 映射：官方 ID 必须是 Claude 身份，且不能重复（选择器里 ID 必须唯一）。
+  // 没填实际模型的行不参与校验，先把角色配置留住。
+  const seen = new Set<string>();
+  for (const route of profile.routes ?? []) {
+    const id = route.id.trim();
+    if (!id || !route.target.trim()) continue;
+    if (!/^claude-[a-z0-9][a-z0-9.-]*(?:\[1m\])?$/.test(id)) {
+      return `映射里的官方模型 ID「${id}」不对，应形如 claude-sonnet-5-5`;
+    }
+    if (seen.has(id)) return `有两个角色都指向了 ${id}，请换一个官方模型`;
+    seen.add(id);
+  }
   return null;
 }
 
@@ -135,6 +253,24 @@ export function normalizeModels(models: string[], primary = ""): string[] {
   for (const raw of [primary, ...models]) {
     const model = raw.trim();
     if (model && !out.includes(model)) out.push(model);
+  }
+  return out;
+}
+
+/**
+ * 保存前的映射表：留下填了官方 ID 的行（实际模型可以为空，表示这个角色不用）；
+ * 同一角色只保留最后一条，字段去空白。
+ */
+export function normalizeRoutes(routes: ModelRoute[]): ModelRoute[] {
+  const out: ModelRoute[] = [];
+  for (const route of routes ?? []) {
+    const id = route.id.trim();
+    if (!id) continue;
+    const slot = (route.slot.trim() || slotOf(id));
+    const entry = { slot, id, target: route.target.trim(), name: route.name.trim(), supports1m: Boolean(route.supports1m) };
+    const index = out.findIndex((known) => known.slot === slot);
+    if (index >= 0) out[index] = entry;
+    else out.push(entry);
   }
   return out;
 }

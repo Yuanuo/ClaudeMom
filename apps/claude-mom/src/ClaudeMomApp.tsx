@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, Download, Eye, EyeOff, Loader2, Play, Plus, RefreshCw, ShieldCheck, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { IMPORT_SOURCES, SOURCE_LABELS, WINDOW_PRESETS, claudeState, emptyProfile, formatWindow, hostOf, isOk, modelLabel, normalizeModels, profileProblem, setupSteps, type ClaudeConfig, type ClaudeStatus, type CommandResult, type UpstreamBook, type UpstreamModel, type UpstreamProfile, templateLabel } from "./model";
+import { FALLBACK_OFFICIAL_MODELS, IMPORT_SOURCES, MODEL_SLOTS, SOURCE_LABELS, WINDOW_PRESETS, claudeState, defaultOfficialId, emptyProfile, formatWindow, hostOf, isOk, modelLabel, normalizeModels, normalizeRoutes, officialName, profileModelLabel, profileProblem, routeForSlot, setupSteps, slotLabel, slotOf, targetLabel, type ClaudeConfig, type ClaudeStatus, type CommandResult, type ModelRoute, type OfficialModel, type UpstreamBook, type UpstreamModel, type UpstreamProfile, templateLabel } from "./model";
 import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from "./updates";
 
 type Tab = "upstream" | "claude";
@@ -29,6 +29,19 @@ export function ClaudeMomApp() {
   }, [notice]);
   const [version, setVersion] = useState("");
   const [update, setUpdate] = useState<UpdateState>({ phase: "idle" });
+  const [officialModels, setOfficialModels] = useState<OfficialModel[]>(FALLBACK_OFFICIAL_MODELS);
+
+  // 官方模型候选来自内嵌录制模板：跟着 Claude 版本走；读不到就用兜底列表，界面仍可手填。
+  useEffect(() => {
+    void (async () => {
+      try {
+        const result = await invoke<CommandResult<{ models: OfficialModel[] }>>("claude_mom_official_models");
+        if (isOk(result) && result.models?.length) setOfficialModels(result.models);
+      } catch {
+        // 用兜底列表
+      }
+    })();
+  }, []);
 
   // 启动时静默查一次更新：只在有新版本时提示，查不到（离线、限流）不打扰。
   useEffect(() => {
@@ -174,7 +187,8 @@ export function ClaudeMomApp() {
     if (!draft) return;
     const problem = profileProblem(draft);
     if (problem) return say(problem, "error");
-    const profile = { ...draft, models: normalizeModels(draft.models, draft.model) };
+    const models = normalizeModels(draft.models, draft.model);
+    const profile = { ...draft, models, routes: normalizeRoutes(draft.routes) };
     const result = await bookCall("save", "claude_mom_save_profile", { profile, activate }, draft.id || undefined);
     // 新增的条目保存后才有 id：选中刚存的那条（列表最后一条或同名那条）。
     if (result && isOk(result) && !draft.id) {
@@ -228,7 +242,7 @@ export function ClaudeMomApp() {
               <span className="cm-radio" data-on={profile.id === book.activeId || undefined} />
               <span className="cm-item-text">
                 <span className="cm-item-name">{profile.name || hostOf(profile.baseUrl)}</span>
-                <span className="cm-item-sub">{profile.model ? modelLabel(profile, profile.model) : hostOf(profile.baseUrl)}</span>
+                <span className="cm-item-sub">{profile.model ? profileModelLabel(profile) : hostOf(profile.baseUrl)}</span>
               </span>
               {profile.source !== "manual" ? <span className="cm-tag">{SOURCE_LABELS[profile.source] ?? profile.source}</span> : null}
             </button>
@@ -253,7 +267,7 @@ export function ClaudeMomApp() {
           <div className="cm-toolbar-text" data-tauri-drag-region>
             <strong>{state.text}</strong>
             <span>
-              {!status?.supported && status ? "需要先安装官方 Claude Desktop" : active ? `${active.name} · ${active.model ? modelLabel(active, active.model) : "未选模型"}` : "还没有上游"}
+              {!status?.supported && status ? "需要先安装官方 Claude Desktop" : active ? `${active.name} · ${active.model ? profileModelLabel(active) : "未选模型"}` : "还没有上游"}
             </span>
           </div>
           <div className="cm-toolbar-actions">
@@ -309,6 +323,7 @@ export function ClaudeMomApp() {
                 }}
                 onFetchModels={() => void fetchModels()}
                 onSave={(activate) => void saveDraft(activate)}
+                officialModels={officialModels}
               />
             ) : (
               <div className="cm-placeholder">
@@ -397,7 +412,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   );
 }
 
-function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActivate, onDelete, onDiscard, onFetchModels }: {
+function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActivate, onDelete, onDiscard, onFetchModels, officialModels }: {
   draft: UpstreamProfile;
   active: boolean;
   dirty: boolean;
@@ -408,6 +423,7 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
   onDelete: () => void;
   onDiscard: () => void;
   onFetchModels: () => void;
+  officialModels: OfficialModel[];
 }) {
   const [showKey, setShowKey] = useState(false);
   const [newModel, setNewModel] = useState("");
@@ -422,6 +438,73 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
     if (!model) return;
     set({ models: normalizeModels([...draft.models, model]), model: draft.model || model });
     setNewModel("");
+  };
+  const routes = draft.routes ?? [];
+  const slotKey = (item: ModelRoute) => item.slot || slotOf(item.id);
+  const slotBase = (slot: string) => MODEL_SLOTS.find((item) => item.slot === slot);
+  // 写入某个角色的行；没有就按官方候选带出默认 ID / 显示名。
+  const setSlot = (slot: string, patch: Partial<ModelRoute>) => {
+    const existing = routes.find((item) => slotKey(item) === slot);
+    const base = slotBase(slot);
+    const id = existing?.id ?? (base ? defaultOfficialId(officialModels, slot, base.fallbackId) : "");
+    const next: ModelRoute = {
+      slot,
+      id,
+      target: existing?.target ?? "",
+      name: existing?.name ?? (id ? officialName(officialModels, id) : ""),
+      supports1m: existing?.supports1m ?? false,
+      ...patch,
+    };
+    set({ routes: existing ? routes.map((item) => (slotKey(item) === slot ? next : item)) : [...routes, next] });
+  };
+  // 选官方 ID 时自动填显示名；用户改过的名字不覆盖。
+  const setSlotOfficial = (slot: string, raw: string) => {
+    const id = raw.trim();
+    const existing = routes.find((item) => slotKey(item) === slot);
+    const previousAuto = existing?.id ? officialName(officialModels, existing.id) : "";
+    const custom = Boolean(existing?.name.trim()) && existing?.name.trim() !== previousAuto;
+    setSlot(slot, { id, name: custom ? existing!.name : (id ? officialName(officialModels, id) : "") });
+  };
+  const extraRoutes = routes.filter((item) => !MODEL_SLOTS.some((base) => base.slot === slotKey(item)));
+  const mappingRow = (slot: string, label: string, fallbackId: string, route?: ModelRoute) => {
+    const id = route?.id ?? defaultOfficialId(officialModels, slot, fallbackId);
+    const name = route?.name ?? officialName(officialModels, id);
+    const target = route?.target ?? "";
+    return (
+      <div className="cm-map-row" data-mapped={target ? true : undefined} key={slot}>
+        <div className="cm-map-role">
+          <strong>{label}</strong>
+          <input
+            aria-label={`${label} 的官方模型 ID`}
+            list="cm-official-model-options"
+            onChange={(event) => setSlotOfficial(slot, event.currentTarget.value)}
+            placeholder="如 claude-sonnet-5-5"
+            spellCheck={false}
+            value={id}
+          />
+        </div>
+        <input
+          aria-label={`${label} 的显示名称`}
+          onChange={(event) => setSlot(slot, { name: event.currentTarget.value })}
+          placeholder="菜单里显示的名字"
+          value={name}
+        />
+        <select
+          aria-label={`${label} 的实际请求模型`}
+          onChange={(event) => setSlot(slot, { target: event.currentTarget.value })}
+          value={target}
+        >
+          <option value="">不使用</option>
+          {options.map((model) => <option key={model} value={model}>{modelLabel(draft, model)}</option>)}
+        </select>
+        <input
+          aria-label={`${label} 声明支持 1M`}
+          checked={route?.supports1m ?? false}
+          onChange={(event) => setSlot(slot, { supports1m: event.currentTarget.checked })}
+          type="checkbox"
+        />
+      </div>
+    );
   };
   return (
     <div className="cm-editor">
@@ -457,7 +540,7 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
           {options.length ? (
             <select aria-label="默认模型" className="cm-grow" onChange={(event) => set({ model: event.currentTarget.value })} value={draft.model}>
               {!draft.model ? <option value="">选一个默认模型</option> : null}
-              {options.map((model) => <option key={model} value={model}>{modelLabel(draft, model)}</option>)}
+              {options.map((model) => <option key={model} value={model}>{targetLabel(draft, model)}</option>)}
             </select>
           ) : (
             <input aria-label="默认模型" className="cm-grow" onChange={(event) => set({ model: event.currentTarget.value })} placeholder="先拉取模型，或直接填模型名" spellCheck={false} value={draft.model} />
@@ -467,12 +550,40 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
           </button>
         </div>
         {draft.models.length > 1 ? <p className="cm-field-hint">在 Claude 里还能切换另外 {draft.models.length - 1} 个模型。</p> : null}
+        {routes.some((route) => route.target) ? (
+          <p className="cm-field-hint">配置映射后，Claude 里的模型以映射角色为准（默认用 Sonnet）；这里选的默认模型用于兜底。</p>
+        ) : null}
+      </section>
+
+      <section className="cm-card">
+        <div className="cm-card-label">模型映射</div>
+        <p className="cm-field-hint cm-map-hint">
+          为 Sonnet / Opus / Fable / Haiku 各选一个上游模型；同一个上游模型可以同时填多个角色。
+          角色留空 = 不使用。显示名可以自己改；勾选 1M 时向客户端声明 1M，否则用上面的上下文窗口。
+        </p>
+        {options.length ? (
+          <div className="cm-map">
+            <div className="cm-map-head">
+              <span>角色 / 官方模型 ID</span><span>显示名称</span><span>实际请求模型</span><span title="向客户端声明 1M 上下文">1M</span>
+            </div>
+            {MODEL_SLOTS.map((item) => mappingRow(item.slot, item.label, item.fallbackId, routeForSlot(draft, item.slot)))}
+            {extraRoutes.map((route) => {
+              const slot = slotKey(route);
+              return mappingRow(slot, slotLabel(slot), "", route);
+            })}
+          </div>
+        ) : (
+          <p className="cm-field-hint">先拉取模型，或在上面的默认模型里填一个。</p>
+        )}
+        <datalist id="cm-official-model-options">
+          {officialModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+        </datalist>
       </section>
 
       <details className="cm-more">
         <summary>高级</summary>
         <div className="cm-form">
-          <Field hint="标题生成等小任务用，留空同默认模型" label="快速模型">
+          <Field hint="标题生成等小任务用；填了 Haiku 角色时以 Haiku 角色为准" label="快速模型">
             <select onChange={(event) => set({ smallModel: event.currentTarget.value })} value={draft.smallModel}>
               <option value="">同默认模型</option>
               {options.map((model) => <option key={model} value={model}>{modelLabel(draft, model)}</option>)}

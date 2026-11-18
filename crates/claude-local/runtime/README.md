@@ -18,6 +18,7 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_GATEWAY_MODELS` | JSON 字符串数组，列出可选的供应商/模型 ID |
 | `CLAUDE_LOCAL_GATEWAY_SMALL_MODEL` | 轻量任务模型，未配置时使用默认模型 |
 | `CLAUDE_LOCAL_GATEWAY_MODEL_WINDOWS` | JSON 对象，逐模型的上下文窗口（`{"provider/model": 1100000}`）；键也接受裸模型名 |
+| `CLAUDE_LOCAL_GATEWAY_MODEL_ROUTES` | JSON 数组，客户端模型 → 上游模型的映射：`[{"id":"claude-sonnet-5-5","target":"deepseek-flash","name":"Sonnet 5.5","supports1m":true}]`；空数组按 `MODELS` 原样 |
 | `CLAUDE_LOCAL_GATEWAY_DEFAULT_WINDOW` | 选中模型没有逐模型声明时界面显示/CLI 使用的窗口；不配则沿用 Claude 自己的 200k 假定值 |
 | `CLAUDE_LOCAL_WEB_I18N_DIR` | 随应用打包的完整中文词表 |
 | `CLAUDE_LOCAL_CACHE_DIR` | 本地代理缓存，听写补丁也写入此目录 |

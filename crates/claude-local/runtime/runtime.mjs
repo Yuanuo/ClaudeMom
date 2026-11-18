@@ -44,6 +44,28 @@ export function runtimeConfig(env = process.env) {
     !isText(key, 8192) || /[\r\n]/.test(key)) {
     throw new Error("Invalid Claude local gateway configuration");
   }
+  // 模型映射：客户端看到的模型 ID → 实际转发的上游模型。空数组 = 按 models 原样暴露。
+  // 元素形状：{ id, target, name, supports1m }；id/target 必填，其余可选。
+  const routes = (() => {
+    const raw = env.CLAUDE_LOCAL_GATEWAY_MODEL_ROUTES;
+    if (raw === undefined || raw === "") return [];
+    let value;
+    try { value = JSON.parse(raw); } catch { throw new Error("Invalid Claude local gateway model routes"); }
+    const valid = (route) => isRecord(route) &&
+      isText(route.id, 512) && route.id && !/[\r\n]/.test(route.id) &&
+      isText(route.target, 512) && route.target && !/[\r\n]/.test(route.target) &&
+      (route.name === undefined || isText(route.name, 512)) &&
+      (route.supports1m === undefined || typeof route.supports1m === "boolean");
+    if (!Array.isArray(value) || value.length > 4096 || !value.every(valid)) {
+      throw new Error("Invalid Claude local gateway model routes");
+    }
+    return value.map((route) => ({
+      id: route.id,
+      target: route.target,
+      name: typeof route.name === "string" ? route.name : "",
+      supports1m: route.supports1m === true,
+    }));
+  })();
   let models = managed ? [model] : ["claude-sonnet-4-6", "claude-opus-4-6"];
   if (env.CLAUDE_LOCAL_GATEWAY_MODELS) {
     try {
@@ -99,7 +121,7 @@ export function runtimeConfig(env = process.env) {
     return resolved;
   })();
   return {
-    managed, gateway, model, smallModel, key,
+    managed, gateway, model, smallModel, key, routes,
     models: [...new Set([model, smallModel, ...models])],
     modelWindows,
     modelNames,
@@ -149,9 +171,35 @@ export function gatewayTarget(config, requestPath) {
   return target;
 }
 
+function routeFor(config, id) {
+  return config.routes?.find((route) => route.id === id);
+}
+
+/** Haiku 档实际用的上游模型：优先映射过的 Haiku 身份，其次快速模型。 */
+function haikuModel(config) {
+  const route = config.routes?.find((item) => /^(?:claude-)?haiku(?:-|$)/i.test(item.id));
+  return route ? route.target : config.smallModel;
+}
+
+/** 客户端可看到、可选择的模型：有映射表时用映射后的身份。 */
+export function clientModels(config) {
+  return config.routes?.length ? config.routes.map((route) => route.id) : config.models;
+}
+
+/** 客户端默认选中的模型（选择器状态、会话默认值）：优先 Sonnet 角色。 */
+export function clientModel(config) {
+  if (!config.routes?.length) return config.model;
+  const sonnet = config.routes.find((route) => /sonnet/i.test(route.id));
+  if (sonnet) return sonnet.id;
+  const selected = config.routes.find((route) => route.target === config.model);
+  return (selected ?? config.routes[0]).id;
+}
+
 export function gatewayModel(config, requested) {
+  const route = routeFor(config, requested);
+  if (route) return route.target;
   if (config.models.includes(requested)) return requested;
-  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return config.smallModel;
+  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return haikuModel(config);
   if (config.managed || !requested || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
   return requested;
 }
@@ -282,13 +330,23 @@ export function isPrivateFile(metadata, { platform = process.platform, uid = pro
   return uid === undefined || metadata.uid === uid;
 }
 
-export function gatewayBody(config, raw) {
+/**
+ * 解析并改写一次 `/v1/messages` 请求体。除改写后的 body 外，还返回客户端声明的
+ * 模型（`requested`）和实际转发的模型（`forwarded`）：映射身份需要在响应里
+ * 把 model 改回客户端认识的那个身份。
+ */
+export function gatewayRequest(config, raw) {
   const value = JSON.parse(raw.toString("utf8"));
   if (!isRecord(value)) throw new Error("Invalid model request");
+  const requested = typeof value.model === "string" ? value.model : "";
   delete value.diagnostics;
   if (isRecord(value.metadata)) delete value.metadata.diagnostics;
   value.model = gatewayModel(config, value.model);
-  return Buffer.from(JSON.stringify(value));
+  return { body: Buffer.from(JSON.stringify(value)), requested, forwarded: value.model };
+}
+
+export function gatewayBody(config, raw) {
+  return gatewayRequest(config, raw).body;
 }
 
 /**
@@ -299,8 +357,10 @@ export function gatewayBody(config, raw) {
  * growthbook 不碰（池模型本来就不在那里，删空了前端怎么兜底说不准）。
  */
 export function dropUnroutedModels(bootstrap, config) {
-  if (!isRecord(bootstrap) || !config.models.length) return;
-  const routable = new Set(config.models);
+  const ids = clientModels(config);
+  if (!isRecord(bootstrap) || !ids.length) return;
+  // 旧会话记录的仍是上游模型名；这些 ID 也要算「可路由」，否则界面报「不支持的模型」。
+  const routable = new Set([...ids, ...(config.routes ?? []).map((route) => route.target)]);
   const keep = (list, key) => Array.isArray(list)
     ? list.filter((entry) => !isRecord(entry) || routable.has(entry[key]))
     : list;
@@ -345,9 +405,32 @@ function clearModelGates(entry) {
  * 最后把池外条目删掉，选择器里只剩 provider/model 条目。
  */
 export function mergePoolModels(bootstrap, config) {
-  const ids = config.models;
+  const ids = clientModels(config);
   if (!isRecord(bootstrap) || !ids.length) return;
   const label = (id) => modelLabel(config, id);
+  // 旧会话记录的是上游模型名；留一份 deprecated 条目让界面能解析，不显示「不支持的模型」。
+  const legacy = [];
+  const legacySeen = new Set(ids);
+  for (const route of config.routes ?? []) {
+    if (route.target === route.id || legacySeen.has(route.target)) continue;
+    legacySeen.add(route.target);
+    legacy.push(route);
+  }
+  const legacyEntry = (entry, route) => clearModelGates({
+    ...entry,
+    id: route.target,
+    model: route.target,
+    name: `旧会话 · ${route.target}`,
+    short_name: route.target,
+    description: `旧会话记录的模型名（现在映射为 ${route.id}）`,
+    section: "deprecated",
+    quick_select: false,
+    hard_limit: modelWindow(config, route.target),
+    context_window: modelWindow(config, route.target),
+    runtime: { max_input_tokens: modelWindow(config, route.target) },
+    disabled: false,
+    disabled_reason: null,
+  });
   const cfg = bootstrap.activeOrganization?.claude_ai_bootstrap_models_config;
   if (Array.isArray(cfg)) {
     const seen = new Set(cfg.map((m) => m?.model));
@@ -355,6 +438,11 @@ export function mergePoolModels(bootstrap, config) {
     for (const entry of cfg) {
       if (!isRecord(entry) || !ids.includes(entry.model)) continue;
       clearModelGates(entry);
+      // 映射/上游给了友好名才覆盖模板里的名字；没名字时保留模板原来那个。
+      if (label(entry.model).name !== entry.model) {
+        entry.name = label(entry.model).name;
+        entry.description = label(entry.model).description || entry.model;
+      }
       entry.hard_limit = modelWindow(config, entry.model);
       entry.context_window = modelWindow(config, entry.model);
     }
@@ -368,12 +456,18 @@ export function mergePoolModels(bootstrap, config) {
         context_window: modelWindow(config, id),
       }));
     }
+    for (const route of legacy) {
+      if (!seen.has(route.target)) cfg.push(legacyEntry(tpl, route));
+    }
   }
   const avail = bootstrap.claude_ai_available_models?.models;
   if (Array.isArray(avail)) {
     const seen = new Set(avail.map((m) => m?.model_id));
     for (const id of ids) {
       if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
+    }
+    for (const route of legacy) {
+      if (!seen.has(route.target)) avail.push({ model_id: route.target, minimum_tier: "free" });
     }
   }
   if (Array.isArray(bootstrap.model_selector_config)) {
@@ -384,6 +478,11 @@ export function mergePoolModels(bootstrap, config) {
       for (const entry of sel.models) {
         if (!isRecord(entry) || !ids.includes(entry.id)) continue;
         clearModelGates(entry);
+        if (label(entry.id).name !== entry.id) {
+          entry.name = label(entry.id).name;
+          entry.short_name = label(entry.id).name;
+          entry.description = label(entry.id).description || entry.id;
+        }
         entry.disabled = false;
         entry.disabled_reason = null;
         entry.hard_limit = modelWindow(config, entry.id);
@@ -407,12 +506,17 @@ export function mergePoolModels(bootstrap, config) {
         entry.disabled_reason = null;
         sel.models.push(entry);
       }
+      // 旧会话用的上游模型名：放在 deprecated 段，只用于解析旧记录。
+      for (const route of legacy) {
+        if (seen.has(route.target)) continue;
+        sel.models.push(legacyEntry(tpl, route));
+      }
     }
   }
   if (Array.isArray(bootstrap.model_selector_state)) {
     const thinking = { type: "effort", effort: "medium" };
     bootstrap.model_selector_state = bootstrap.model_selector_state.map((s) => s && typeof s === "object"
-      ? { ...s, model: config.model, thinking_by_model: ids.map((id) => ({ id, thinking })) }
+      ? { ...s, model: clientModel(config), thinking_by_model: ids.map((id) => ({ id, thinking })) }
       : s);
   }
   if (config.hideUnroutedModels) dropUnroutedModels(bootstrap, config);
@@ -420,18 +524,20 @@ export function mergePoolModels(bootstrap, config) {
 
 /** 选择器里的名称与副标题：有友好名用友好名（副标题是供应商），否则名称沿用模型 id、副标题为空。 */
 export function modelLabel(config, id) {
+  // 映射后的名字按客户端 ID 存；上游原生 ID 则用上游名字。
   const entry = config.modelNames?.[id];
   return { name: entry?.name || id, description: entry?.description || "" };
 }
 
 export function modelList(config) {
+  const ids = clientModels(config);
   return {
-    data: config.models.map((id) => ({
-      id, type: "model", display_name: config.modelNames?.[id]?.name || id, created_at: "2026-01-01T00:00:00Z",
+    data: ids.map((id) => ({
+      id, type: "model", display_name: modelLabel(config, id).name, created_at: "2026-01-01T00:00:00Z",
     })),
     has_more: false,
-    first_id: config.models[0] ?? null,
-    last_id: config.models.at(-1) ?? null,
+    first_id: ids[0] ?? null,
+    last_id: ids.at(-1) ?? null,
   };
 }
 
@@ -445,6 +551,14 @@ export function modelList(config) {
  * 其余没声明的模型仍按 Claude 自己的假定值。
  */
 export function modelWindow(config, model) {
+  const requested = typeof model === "string" ? model : "";
+  const route = routeFor(config, requested);
+  // 映射行：声明 1M 就按 1M，否则按它对应的上游模型窗口。
+  if (route) return route.supports1m ? 1_000_000 : upstreamWindow(config, route.target);
+  return upstreamWindow(config, requested);
+}
+
+function upstreamWindow(config, model) {
   const windows = config.modelWindows ?? {};
   const id = typeof model === "string" ? model : "";
   if (Object.hasOwn(windows, id)) return windows[id];
@@ -462,11 +576,13 @@ export function modelWindow(config, model) {
   return DEFAULT_MODEL_WINDOW;
 }
 
-export function modelSelectors(config, selected = config.model) {
-  const model = gatewayModel(config, selected);
+export function modelSelectors(config, selected = clientModel(config)) {
+  const ids = clientModels(config);
+  // 选择器状态里永远是客户端模型 ID，不能换成上游模型。
+  const model = ids.includes(selected) ? selected : clientModel(config);
   const thinking = { type: "effort", effort: "medium" };
   // Code / Cowork 等页面的模型选择器读的是这里，不是 /v1/models：名称与副标题同样用友好名。
-  const models = config.models.map((id) => ({
+  const models = ids.map((id) => ({
     id,
     name: modelLabel(config, id).name,
     short_name: modelLabel(config, id).name,
@@ -479,10 +595,30 @@ export function modelSelectors(config, selected = config.model) {
     capabilities: { compass: false, gsuite_tools: false, mm_images: false, mm_pdf: false, web_search: false },
     thinking: { type: "effort", effort_options: [{ id: "medium", name: "Medium" }] },
   }));
+  // 旧会话记录的是上游模型名：放进 deprecated 段（界面不会列进选择器），但能被解析到。
+  const seenLegacy = new Set(ids);
+  for (const route of config.routes ?? []) {
+    if (route.target === route.id || seenLegacy.has(route.target)) continue;
+    seenLegacy.add(route.target);
+    models.push({
+      id: route.target,
+      name: `旧会话 · ${route.target}`,
+      short_name: route.target,
+      description: `旧会话记录的模型名（现在映射为 ${route.id}）`,
+      section: "deprecated",
+      quick_select: false,
+      disabled: false, disabled_reason: null,
+      hard_limit: modelWindow(config, route.target),
+      context_window: modelWindow(config, route.target),
+      runtime: { max_input_tokens: modelWindow(config, route.target) },
+      capabilities: { compass: false, gsuite_tools: false, mm_images: false, mm_pdf: false, web_search: false },
+      thinking: { type: "effort", effort_options: [{ id: "medium", name: "Medium" }] },
+    });
+  }
   const surfaces = ["chat", "code", "cc", "ccr", "ccd", "cowork", "design", "office_agent", "claude_science"];
   return {
     model_selector_state: surfaces.map((id) => ({
-      id, model, thinking, thinking_by_model: config.models.map((id) => ({ id, thinking })),
+      id, model, thinking, thinking_by_model: ids.map((id) => ({ id, thinking })),
       selection_source: "global_default",
     })),
     model_selector_config: surfaces.map((id) => ({

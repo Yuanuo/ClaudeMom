@@ -104,6 +104,27 @@ async function request(pathname, { host, body, method = body === undefined ? "GE
   }
 }
 
+// 直连本地服务的原始响应（SSE 不能当 JSON 解析）。
+async function requestRaw(pathname, body) {
+  const raw = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "127.0.0.1", port: proxyPort, path: pathname, method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(raw) },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    req.on("error", reject);
+    req.end(raw);
+  });
+}
+
 async function requestText(host, pathname, headers = {}) {
   const connect = http.request({
     hostname: "127.0.0.1", port: proxyPort, method: "CONNECT", path: `${host}:443`,
@@ -299,12 +320,20 @@ before(async () => {
   gateway = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
     gatewayRequests.push({
       path: req.url,
-      body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"),
+      body,
     });
+    if (body.stream === true) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: body.model, role: "assistant", content: [] } })}\n\n`);
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      res.end();
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ type: "message", content: [{ type: "text", text: "ok" }] }));
+    res.end(JSON.stringify({ type: "message", model: body.model, content: [{ type: "text", text: "ok" }] }));
   });
   const gatewayPort = await listen(gateway);
   // 假上游：记录代理转发过来的 host 头与路径
@@ -342,6 +371,9 @@ before(async () => {
     env: {
       ...process.env,
       CLAUDE_LOCAL_GATEWAY_URL: `http://127.0.0.1:${gatewayPort}`,
+      CLAUDE_LOCAL_GATEWAY_MODEL_ROUTES: JSON.stringify([
+        { id: "claude-sonnet-5-5", target: "claude-sonnet-4-6", name: "Sonnet 5.5", supports1m: true },
+      ]),
       CLAUDE_LOCAL_UPSTREAM_MAP: JSON.stringify({
         "downloads.claude.ai": `http://127.0.0.1:${upstreamFixturePort}`,
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
@@ -791,6 +823,26 @@ test("model requests strip diagnostics and preserve the rest of the payload", as
   });
   assert.equal(result.status, 200);
   assert.deepEqual(gatewayRequests.at(-1), { path: "/v1/messages?beta=true", body: payload });
+});
+
+test("model routes expose only mapped client models and map to the provider model", async () => {
+  const list = await request("/v1/models");
+  assert.deepEqual(list.body.data.map((model) => model.id), ["claude-sonnet-5-5"]);
+  const result = await request("/v1/messages", {
+    body: { model: "claude-sonnet-5-5", messages: [{ role: "user", content: "hi" }], max_tokens: 8 },
+  });
+  assert.equal(gatewayRequests.at(-1).body.model, "claude-sonnet-4-6");
+  assert.equal(result.body.model, "claude-sonnet-5-5");
+});
+
+test("model routes also rewrite the streamed message_start model", async () => {
+  const result = await requestRaw("/v1/messages", {
+    model: "claude-sonnet-5-5", stream: true, messages: [{ role: "user", content: "hi" }], max_tokens: 8,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(gatewayRequests.at(-1).body.model, "claude-sonnet-4-6");
+  assert.match(result.body, /"model":"claude-sonnet-5-5"/);
+  assert.doesNotMatch(result.body, /claude-sonnet-4-6/);
 });
 
 for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {

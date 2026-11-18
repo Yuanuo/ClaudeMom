@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { clientModel, clientModels, createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayRequest, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -1146,6 +1146,70 @@ test("gateway contracts keep duplicate model names distinct and old sessions use
   assert.equal(gatewayModel(config, undefined), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-native-default"), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-haiku-4-5"), modelIds[2]);
+});
+
+test("model routes expose Claude identities and map back to the provider models", () => {
+  const base = {
+    CLAUDE_LOCAL_MANAGED: "1", CLAUDE_LOCAL_GATEWAY_URL: "https://localhost/gw/test/",
+    CLAUDE_LOCAL_GATEWAY_MODEL: modelIds[0], CLAUDE_LOCAL_GATEWAY_KEY: "test",
+    CLAUDE_LOCAL_GATEWAY_SMALL_MODEL: modelIds[2],
+    CLAUDE_LOCAL_GATEWAY_MODELS: JSON.stringify(modelIds),
+    CLAUDE_LOCAL_GATEWAY_MODEL_WINDOWS: JSON.stringify(modelWindows),
+  };
+  const plain = runtimeConfig(base);
+  assert.deepEqual(clientModels(plain), plain.models, "没有映射表时列表原样");
+  assert.equal(clientModel(plain), modelIds[0]);
+
+  const config = runtimeConfig({
+    ...base,
+    CLAUDE_LOCAL_GATEWAY_MODEL_ROUTES: JSON.stringify([
+      { id: "claude-sonnet-5-5", target: modelIds[0], name: "Sonnet 5.5", supports1m: true },
+      { id: "claude-opus-5-5", target: modelIds[0], name: "Opus 5.5", supports1m: false },
+      { id: "claude-haiku-5-5", target: modelIds[2], name: "Haiku 5.5", supports1m: false },
+      { id: modelIds[1], target: modelIds[1], name: "", supports1m: false },
+    ]),
+  });
+  assert.deepEqual(clientModels(config), ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", modelIds[1]]);
+  assert.equal(clientModel(config), "claude-sonnet-5-5", "默认用 Sonnet 角色");
+  assert.equal(gatewayModel(config, "claude-sonnet-5-5"), modelIds[0]);
+  assert.equal(gatewayModel(config, "claude-opus-5-5"), modelIds[0], "多个角色可指向同一个上游模型");
+  assert.equal(gatewayModel(config, "claude-haiku-5-5"), modelIds[2]);
+  assert.equal(gatewayModel(config, "claude-haiku-4-5"), modelIds[2], "其它 Haiku 身份也走 Haiku 角色");
+  assert.equal(gatewayModel(config, modelIds[1]), modelIds[1], "池内模型仍可直通");
+  assert.equal(modelWindow(config, "claude-sonnet-5-5"), 1_000_000, "声明 1M 就按 1M");
+  assert.equal(modelWindow(config, "claude-opus-5-5"), modelWindows[modelIds[0]], "没声明 1M 时按上游窗口");
+  assert.equal(modelWindow(config, "claude-haiku-5-5"), modelWindows[modelIds[2]]);
+
+  const prepared = gatewayRequest(config, Buffer.from(JSON.stringify({ model: "claude-sonnet-5-5", messages: [] })));
+  assert.equal(JSON.parse(prepared.body.toString("utf8")).model, modelIds[0]);
+  assert.equal(prepared.requested, "claude-sonnet-5-5");
+  assert.equal(prepared.forwarded, modelIds[0]);
+
+  const selectors = modelSelectors(config);
+  const models = selectors.model_selector_config[0].models;
+  assert.deepEqual(
+    models.slice(0, 4).map((entry) => entry.id),
+    ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", modelIds[1]],
+  );
+  assert.equal(models[0].context_window, 1_000_000);
+  // 旧会话的上游模型名也在列表里，但放在 deprecated 段（界面不显示，只用于解析旧记录）。
+  assert.equal(models.find((entry) => entry.id === modelIds[0])?.section, "deprecated");
+  assert.equal(selectors.model_selector_state[0].model, "claude-sonnet-5-5");
+
+  const bootstrap = {
+    activeOrganization: { claude_ai_bootstrap_models_config: [{ model: "claude-opus-5-5" }, { model: modelIds[1] }] },
+    claude_ai_available_models: { models: [{ model_id: modelIds[0] }, { model_id: "claude-sonnet-5-5" }] },
+    model_selector_config: [{ id: "ccd", models: [{ id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: modelIds[2] }] }],
+    model_selector_state: [{ id: "ccd", model: modelIds[0] }],
+  };
+  mergePoolModels(bootstrap, config);
+  const ids = bootstrap.model_selector_config[0].models.map((entry) => entry.id);
+  for (const id of ["claude-sonnet-5-5", "claude-haiku-5-5", modelIds[1]]) assert.ok(ids.includes(id), id);
+  // 旧会话存的仍是上游模型名：留一个 deprecated 条目供界面解析，不进主选择器。
+  const legacy = bootstrap.model_selector_config[0].models.find((entry) => entry.id === modelIds[0]);
+  assert.equal(legacy?.section, "deprecated");
+  assert.equal(bootstrap.model_selector_state[0].model, "claude-sonnet-5-5");
+  assert.equal(bootstrap.claude_ai_available_models.models.some((entry) => entry.model_id === modelIds[0]), true, "旧模型名仍可解析");
 });
 
 test("native bootstrap models without a provider are dropped from every picker list", () => {

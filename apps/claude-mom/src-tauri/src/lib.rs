@@ -67,6 +67,7 @@ pub fn run() {
             commands::claude_mom_set_active,
             commands::claude_mom_import,
             commands::claude_mom_fetch_models,
+            commands::claude_mom_official_models,
             commands::claude_mom_set_voice,
             commands::dictation_local_model_status,
             commands::download_dictation_local_model,

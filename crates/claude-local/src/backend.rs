@@ -57,6 +57,72 @@ pub struct TemplateVersion {
     pub built_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialModel {
+    pub id: String,
+    pub name: String,
+}
+
+/// 录制模板里的原生模型清单（官方 ID + 显示名），给「模型映射」表单做候选。
+/// 按模板里的选择器顺序去重；模板缺失或损坏时返回空表，界面仍可手填。
+pub fn official_models() -> Vec<OfficialModel> {
+    let Some(newest) = template_versions().into_iter().next() else {
+        return Vec::new();
+    };
+    let asset = format!("mock/{}/bootstrap.json", newest.build);
+    let Some((_, bytes)) = TEMPLATE_ASSETS
+        .iter()
+        .find(|(name, _)| *name == asset.as_str())
+    else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Vec::new();
+    };
+    let mut models: Vec<OfficialModel> = Vec::new();
+    for selector in value
+        .get("model_selector_config")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for entry in selector
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = entry.get("id").and_then(Value::as_str).map(str::trim) else {
+                continue;
+            };
+            // 选择器里还混着带日期的快照 ID 和 [1m] 变体；这里只留可读的短 ID。
+            if !id.starts_with("claude-")
+                || id.ends_with('-')
+                || id.contains("[1m]")
+                || id.rsplit_once('-').is_some_and(|(_, suffix)| {
+                    suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                || models.iter().any(|known| known.id == id)
+            {
+                continue;
+            }
+            let name = entry
+                .get("name")
+                .or_else(|| entry.get("short_name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(id);
+            models.push(OfficialModel {
+                id: id.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+    models
+}
+
 const ASSETS: &[(&str, &[u8])] = &[
     (
         "proxy.mjs",
@@ -1946,6 +2012,11 @@ fn start_backend(
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODELS",
             serde_json::to_string(&upstream.models)?,
+        )
+        // 客户端模型 → 上游模型的映射。空数组 = 按 models 原样暴露（老配置）。
+        .env(
+            "CLAUDE_LOCAL_GATEWAY_MODEL_ROUTES",
+            serde_json::to_string(&upstream.routes)?,
         )
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODEL_NAMES",
@@ -3903,6 +3974,21 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn official_models_come_from_the_newest_template_and_stay_readable() {
+        let models = official_models();
+        assert!(!models.is_empty(), "内嵌模板里应有官方模型");
+        assert!(models.iter().any(|model| model.id == "claude-sonnet-5-5"));
+        assert!(models.iter().all(|model| model.id.starts_with("claude-")));
+        assert!(!models.iter().any(|model| model.id.contains("[1m]")));
+        assert!(!models.iter().any(|model| model.id.ends_with('-')));
+        assert!(!models.iter().any(|model| {
+            model.id.rsplit_once('-').is_some_and(|(_, suffix)| {
+                suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }));
     }
 
     #[test]

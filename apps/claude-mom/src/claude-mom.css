@@ -265,6 +265,27 @@ button.cm-update-chip:hover { background: var(--cm-accent); color: #fff; }
   height: 30px; padding: 0 8px; border: 1px solid var(--cm-line-strong); border-radius: var(--cm-radius); background: var(--cm-panel);
 }
 .cm-grow { flex: 1; min-width: 0; }
+.cm-map-hint { margin: 0; }
+.cm-map { display: flex; flex-direction: column; gap: 6px; }
+.cm-map-head, .cm-map-row {
+  display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.95fr) minmax(0, 1.1fr) 30px;
+  gap: 6px; align-items: center; min-width: 0;
+}
+.cm-map-head { font-size: 11px; color: var(--cm-muted); }
+.cm-map-head > :last-child { text-align: center; }
+.cm-map-row input:not([type="checkbox"]), .cm-map-row select {
+  width: 100%; height: 28px; min-width: 0; padding: 0 6px;
+  border: 1px solid var(--cm-line-strong); border-radius: var(--cm-radius); background: var(--cm-panel);
+  font-family: var(--cm-mono); font-size: 11.5px;
+}
+.cm-map-row input:not([type="checkbox"]):focus, .cm-map-row select:focus {
+  outline: none; border-color: var(--cm-accent); box-shadow: 0 0 0 3px var(--cm-accent-soft);
+}
+.cm-map-row input[type="checkbox"] { justify-self: center; }
+.cm-map-role { display: flex; flex-direction: column; gap: 3px; min-width: 0; line-height: 1.3; }
+.cm-map-role strong { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cm-map-row .cm-map-role input { font-size: 10.5px; height: 22px; }
+.cm-map-row[data-mapped] .cm-map-role strong { color: var(--cm-accent); }
 .cm-mono { font-family: var(--cm-mono); font-size: 12px; }
 .cm-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .cm-link { border: 0; background: transparent; padding: 0; color: var(--cm-accent); font-size: 12.5px; white-space: nowrap; }

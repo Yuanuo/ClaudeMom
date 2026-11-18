@@ -9,9 +9,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, bail};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::settings::ClaudeLocalSettings;
+
+/// 一条模型映射：客户端看到 `id`，实际请求发到 `target`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoute {
+    /// 客户端看到的模型 ID（通常是官方 Claude ID）。
+    pub id: String,
+    /// 实际转发给上游的模型 ID。
+    pub target: String,
+    /// 选择器里的显示名；空 = 用上游显示名或 id。
+    pub name: String,
+    /// 声明 1M 窗口（选择器按 1M 显示）。
+    pub supports_1m: bool,
+}
 
 /// 交给本地兼容服务和内置 Claude Code 的上游。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,6 +47,8 @@ pub struct Upstream {
     pub model_windows: BTreeMap<String, u64>,
     /// 默认模型的上下文窗口；`None` 表示不声明，Claude 按 200k 处理。
     pub default_window: Option<u64>,
+    /// 客户端模型 → 上游模型的映射（含未映射模型的恒等条目）。空 = 按 `models` 原样。
+    pub routes: Vec<ModelRoute>,
     /// 启动 Claude 时额外带上的环境变量（例如 Codex++ 的 `CLAUDE_CODE_MODEL_CAPABILITIES`）。
     pub extra_env: Vec<(String, String)>,
 }
@@ -68,6 +85,7 @@ pub trait Host: Send + Sync {
                     "model": upstream.default_model,
                     "small": upstream.small_model,
                     "models": upstream.models,
+                    "routes": upstream.routes,
                     "windows": upstream.model_windows,
                     "window": upstream.default_window,
                 })
