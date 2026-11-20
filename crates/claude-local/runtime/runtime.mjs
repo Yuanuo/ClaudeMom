@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { installablePlugin } from "./plugins.mjs";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_TEXT = 1024 * 1024;
@@ -195,12 +196,41 @@ export function clientModel(config) {
   return (selected ?? config.routes[0]).id;
 }
 
+const WINDOW_SUFFIX = /\[\d+[km]\]$/i;
+
+function uniqueModelAlias(models, requested) {
+  const target = requested.replace(WINDOW_SUFFIX, "");
+  if (!target) return;
+  const suffix = requested.slice(target.length).toLowerCase();
+  let bestRank = 0;
+  let match;
+  for (const id of models) {
+    const name = id.replace(WINDOW_SUFFIX, "");
+    const candidateSuffix = id.slice(name.length).toLowerCase();
+    if (suffix && candidateSuffix && suffix !== candidateSuffix) continue;
+    const fullName = name === target;
+    if (!fullName && !name.endsWith(`.${target}`) && !name.endsWith(`/${target}`)) continue;
+    const rank = (fullName ? 3 : 1) + Number(suffix !== "" && suffix === candidateSuffix);
+    if (rank > bestRank) {
+      bestRank = rank;
+      match = id;
+    } else if (rank === bestRank) {
+      match = undefined;
+    }
+  }
+  return match;
+}
+
 export function gatewayModel(config, requested) {
   const route = routeFor(config, requested);
   if (route) return route.target;
+  if (typeof requested !== "string" || !requested) return config.model;
   if (config.models.includes(requested)) return requested;
-  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return haikuModel(config);
-  if (config.managed || !requested || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
+  const matched = uniqueModelAlias(config.models, requested);
+  if (matched) return matched;
+
+  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested)) return haikuModel(config);
+  if (config.managed || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
   return requested;
 }
 
@@ -672,7 +702,8 @@ function validateNotifications(entry) {
           ["push_source", "email_source"].includes(key) && isText(value, 64))));
 }
 
-export function createStateStore(file, conversations, notifications, warn = () => {}) {
+/** `plugins`：装上的插件，id → 安装时那份目录记录。旧状态文件没有这一项。 */
+export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map()) {
   let timer;
   let disabled = false;
   if (file && fs.existsSync(file)) {
@@ -682,7 +713,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
       if (!isRecord(state) || state.version !== 1 || !Array.isArray(state.conversations) ||
         state.conversations.length > 2000 || !state.conversations.every(validateConversation) ||
         !Array.isArray(state.notifications) || state.notifications.length > 2000 ||
-        !state.notifications.every(validateNotifications)) throw new Error("Invalid state contract");
+        !state.notifications.every(validateNotifications) ||
+        !(state.plugins === undefined || Array.isArray(state.plugins) && state.plugins.length <= 500 &&
+          state.plugins.every(installablePlugin))) throw new Error("Invalid state contract");
       for (const conv of state.conversations) {
         // 中断的请求不自动重发，避免重启后重复计费或执行。
         for (const turn of conv.turns) {
@@ -696,6 +729,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
         conversations.set(conv.uuid, conv);
       }
       for (const entry of state.notifications) notifications.set(entry.org, entry.value);
+      for (const entry of state.plugins ?? []) plugins.set(entry.id, entry);
     } catch {
       disabled = true;
       warn("Local conversation state is invalid; the original file was preserved");
@@ -711,6 +745,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
         version: 1,
         conversations: [...conversations.values()],
         notifications: [...notifications].map(([org, value]) => ({ org, value })),
+        plugins: [...plugins.values()],
       }));
       if (body.length > MAX_STATE_BYTES) throw new Error("State exceeds size limit");
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

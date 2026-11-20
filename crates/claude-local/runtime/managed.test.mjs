@@ -14,8 +14,8 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
-import { createOfficialAssets } from "./official-assets.mjs";
-import { clientModel, clientModels, createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayRequest, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
+import { clientModel, clientModels, createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isPrivateFile, gatewayModel, gatewayRequest, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -178,7 +178,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "plugins.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -510,6 +510,46 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
   }
 });
 
+test("loadCoworkSystemPrompt extracts the cowork prompt from app.asar", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-app-"));
+  try {
+    fs.writeFileSync(path.join(dir, "app.asar"), [
+      ' '.repeat(1024 * 1024 - 24),
+      'var t = `<application_details>\\nClaude is operating as an agent inside the Claude desktop app.\\nUse \\`file tools\\`.\\nLiteral: \\\\n and \\${text}. \\u2192 \\u{1F600}\\n</application_details>`;',
+      "module.exports = t;",
+    ].join("\n"));
+    assert.equal(
+      loadCoworkSystemPrompt(dir),
+      [
+        "<application_details>",
+        "Claude is operating as an agent inside the Claude desktop app.",
+        "Use `file tools`.",
+        "Literal: \\n and ${text}. → 😀",
+        "</application_details>",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadCoworkSystemPrompt returns an empty string when the prompt is unavailable", () => {
+  assert.equal(loadCoworkSystemPrompt(""), "");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-app-"));
+  try {
+    assert.equal(loadCoworkSystemPrompt(dir), "");
+    fs.writeFileSync(path.join(dir, "app.asar"), "no prompt here");
+    assert.equal(loadCoworkSystemPrompt(dir), "");
+    const prefix = '`<application_details>\\nClaude is operating as an agent inside the Claude desktop app.';
+    for (const tail of ["unfinished", "${dynamic}`", "x".repeat(256 * 1024) + "`"]) {
+      fs.writeFileSync(path.join(dir, "app.asar"), prefix + tail);
+      assert.equal(loadCoworkSystemPrompt(dir), "");
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
   // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
   const resourcesDir = path.join(root, "unpacked-resources");
@@ -581,6 +621,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
   fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
+    system_prompts: { other_prompt: { on: false } },
     org_growthbook: {
       hashing_algorithm: "djb2",
       features: {
@@ -600,12 +641,18 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   const features = async (extra) => {
     const instance = await start({ ...env, ...extra }, runtimeDir);
     try {
-      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const bootstrap = (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const prompts = await request(instance, "/api/bootstrap/local/system_prompts", { host: "claude.ai" });
+      assert.equal(prompts.status, 200);
+      assert.deepEqual(prompts.json, bootstrap.system_prompts);
+      return bootstrap;
     } finally {
       await stop(instance);
     }
   };
   const on = await features({});
+  assert.deepEqual(on.system_prompts.other_prompt, { on: false });
+  assert.ok(on.system_prompts.cowork_system_prompt.value.prompt.length > 0);
   assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
   assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
   assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
@@ -613,6 +660,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
   assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
+  assert.deepEqual(off.system_prompts, { other_prompt: { on: false } });
   assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
   assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: false }, "主页样式和 Cowork 开关互不相干");
   // 设置里选了合并式主页：两处都按模板原样。
@@ -1031,6 +1079,23 @@ test("REST completions show the upstream's error in the reply and end the stream
   assert.equal(service.output().includes("invalid x-api-key"), false, "受管模式不把上游错误细节写进日志");
 });
 
+test("REST chats reopen with the last selected model and use it for the next reply", async () => {
+  const base = `/api/organizations/local/chat_conversations/${crypto.randomUUID()}`;
+  const host = "claude.ai";
+  await request(service, `${base}/completion`, { host, body: { prompt: "first turn" } });
+  assert.equal(received.at(-1).body.model, modelIds[0]);
+  await request(service, `${base}/completion`, { host, body: { prompt: "switch model", model: modelIds[2] } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+
+  await stop(service);
+  service = await start();
+  const detail = (await request(service, base, { host })).json;
+  assert.equal(detail.model, modelIds[2]);
+  assert.equal(detail.chat_messages.length, 4);
+  await request(service, `${base}/completion`, { host, body: { prompt: "continue" } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+});
+
 test("REST completions accept compressed request bodies and conversations can be renamed and deleted", async () => {
   const conv = crypto.randomUUID();
   const base = `/api/organizations/local/chat_conversations/${conv}`;
@@ -1061,6 +1126,9 @@ test("RPC replies carry the upstream's HTTP error and RPC conversations open wit
   const detail = await request(service, `/api/organizations/local/chat_conversations/${conv}`, { host: "claude.ai" });
   const messages = detail.json.chat_messages;
   assert.deepEqual(messages.map((m) => m.sender), ["human", "assistant"]);
+  for (const message of messages) {
+    for (const field of ["files", "files_v2", "attachments", "sync_sources"]) assert.deepEqual(message[field], [], field);
+  }
   assert.equal(messages[0].text, "case:http-401");
   assert.match(messages[1].text, /\[网关错误：上游返回 HTTP 401：invalid x-api-key\]$/);
   assert.equal(messages[1].parent_message_uuid, messages[0].uuid);
@@ -1131,6 +1199,31 @@ test("state loader validates contracts, preserves corrupt files and settles inte
   createStateStore(path.join(root, "interrupted.json"), conversations, new Map());
   assert.equal(conversations.values().next().value.turns[0].stopReason, "interrupted");
   assert.equal(conversations.values().next().value.turns[0].complete, true);
+});
+
+test("installed plugins survive a restart and state without them still loads", () => {
+  const file = path.join(root, "plugins-state.json");
+  const plugin = {
+    id: "plugin_fixture01", manifest_name: "demo-manifest",
+    source: { type: "directory", repository: { url: "https://github.com/acme/tools", reviewed_commit: "0".repeat(40) } },
+  };
+  createStateStore(file, new Map(), new Map(), undefined, new Map([[plugin.id, plugin]])).flush();
+  const restored = new Map();
+  createStateStore(file, new Map(), new Map(), undefined, restored);
+  assert.deepEqual([...restored], [[plugin.id, plugin]]);
+
+  // 0.1.9 及以前的状态文件没有 plugins。
+  const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete legacy.plugins;
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  const warnings = [];
+  createStateStore(file, new Map(), new Map(), (message) => warnings.push(message), new Map());
+  assert.deepEqual(warnings, []);
+
+  // 记录里没有能下载的源码位置：整份状态按损坏处理，不带着装不了的插件跑。
+  fs.writeFileSync(file, JSON.stringify({ ...legacy, plugins: [{ id: "plugin_fixture01", manifest_name: "demo-manifest" }] }));
+  createStateStore(file, new Map(), new Map(), (message) => warnings.push(message), new Map());
+  assert.equal(warnings.length, 1);
 });
 
 test("gateway contracts keep duplicate model names distinct and old sessions use the default", () => {
@@ -1210,6 +1303,26 @@ test("model routes expose Claude identities and map back to the provider models"
   assert.equal(legacy?.section, "deprecated");
   assert.equal(bootstrap.model_selector_state[0].model, "claude-sonnet-5-5");
   assert.equal(bootstrap.claude_ai_available_models.models.some((entry) => entry.model_id === modelIds[0]), true, "旧模型名仍可解析");
+});
+
+test("gateway aliases preserve the configured ID and only resolve unique window or namespace matches", () => {
+  const opus = "relay.anthropic.claude-opus[1m]";
+  const models = [opus, "relay/sonnet[128k]", "alpha/shared", "beta/shared", "shared[1m]",
+    "alpha/duplicate", "beta.duplicate[128k]", "relay/preview[beta]", "alpha/sized[128k]", "beta/sized[1m]"];
+  for (const pool of [models, [...models].reverse()]) {
+    const config = { managed: true, model: "default", smallModel: "small", models: pool };
+    for (const [requested, expected] of [
+      [opus, opus], ["relay.anthropic.claude-opus", opus], ["claude-opus", opus],
+      ["sonnet", "relay/sonnet[128k]"], ["shared", "shared[1m]"], ["alpha/shared", "alpha/shared"],
+      ["sized[1m]", "beta/sized[1m]"], ["sized[32k]", "default"], ["sized", "default"],
+      ["duplicate", "default"], ["preview", "default"], ["nus", "default"], ["claude-haiku-4", "small"],
+    ]) {
+      assert.equal(gatewayModel(config, requested), expected, requested);
+    }
+    const payload = gatewayBody(config, Buffer.from(JSON.stringify({ model: "claude-opus", messages: [] })));
+    assert.equal(JSON.parse(payload).model, opus);
+    assert.equal(gatewayModel({ ...config, managed: false }, "duplicate"), "duplicate");
+  }
 });
 
 test("native bootstrap models without a provider are dropped from every picker list", () => {

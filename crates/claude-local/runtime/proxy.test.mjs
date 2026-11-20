@@ -11,7 +11,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { crc32, gzipSync, gunzipSync } from "node:zlib";
 import { startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { facadeFixture, recorderFixture } from "./scripts/fixtures/dictation-start.mjs";
 
@@ -20,12 +20,14 @@ const gatewayRequests = [];
 const upstreamRequests = [];
 const cdnAssetPath = "/claude-ai/v2/assets/v1/codex-fixture-AbCd1234.js";
 const cdnAssetBody = gzipSync('export const fixture = "cached CDN bytes";');
+const coworkPromptFixture = "<application_details>\nClaude test agent.\n</application_details>";
 let gateway;
 let upstreamFixture;
 let upstreamFixturePort;
 let proxy;
 let proxyClosed;
 let proxyPort;
+let coworkPromptFile;
 let dictationFixture;
 let dictationFixturePort;
 let dictationStateDir;
@@ -34,6 +36,94 @@ let dictationAssetPath;
 let dictationUpgrade;
 let dictationFrame;
 const streamFixtureSize = 4 * 1024 * 1024;
+
+// 公开插件目录里的一条记录：插件在仓库的子目录里，带一个 skill 和一个会运行代码的钩子。
+const pluginCommit = "0123456789abcdef0123456789abcdef01234567";
+const pluginFixture = {
+  id: "plugin_fixture01",
+  name: "Demo Tools",
+  manifest_name: "demo-manifest",
+  summary: "Demo plugin",
+  release: { version: "1.2.3" },
+  added_time: "2026-10-01T00:00:00Z",
+  updated_time: "2026-11-01T00:00:00Z",
+  source: {
+    type: "directory",
+    marketplace_slug: "anthropic-plugin-directory",
+    repository: { url: "https://github.com/acme/tools", reviewed_commit: pluginCommit, path: "plugins/demo" },
+  },
+  components: [
+    { type: "skill", name: "demo-skill", description: "Does the demo", access: { type: "stays_inside_claude" } },
+    { type: "hook", name: "SessionStart", access: { type: "runs_on_your_computer" } },
+  ],
+  installation: { state: "signed_out", actions: { sign_in: true } },
+};
+const pluginFiles = {
+  "README.md": "repo readme",
+  "plugins/demo/.claude-plugin/plugin.json": '{"name":"demo"}',
+  "plugins/demo/skills/demo-skill/SKILL.md": "# demo skill",
+  "plugins/other/notes.txt": "another plugin",
+};
+
+/** 不压缩的 zip：GitHub 源码包的样子，所有条目在 `<仓库>-<提交号>/` 下。 */
+function storedZip(files) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const data = Buffer.from(content);
+    const label = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(crc32(data), 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(label.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(crc32(data), 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(label.length, 28);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, label, data);
+    centrals.push(central, label);
+    offset += 30 + label.length + data.length;
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(centrals.length / 2, 8);
+  end.writeUInt16LE(centrals.length / 2, 10);
+  end.writeUInt32LE(centrals.reduce((size, part) => size + part.length, 0), 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, ...centrals, end]);
+}
+
+/** 读回不压缩的 zip：条目名 → 内容，按本地文件头找数据并核对校验和。 */
+function storedZipEntries(zip) {
+  const end = zip.length - 22;
+  assert.equal(zip.readUInt32LE(end), 0x06054b50);
+  const entries = {};
+  let at = zip.readUInt32LE(end + 16);
+  for (let index = 0; index < zip.readUInt16LE(end + 10); index++) {
+    assert.equal(zip.readUInt32LE(at), 0x02014b50);
+    const size = zip.readUInt32LE(at + 20);
+    const nameLength = zip.readUInt16LE(at + 28);
+    const name = zip.toString("utf8", at + 46, at + 46 + nameLength);
+    const localAt = zip.readUInt32LE(at + 42);
+    assert.equal(zip.readUInt32LE(localAt), 0x04034b50);
+    assert.equal(zip.toString("utf8", localAt + 30, localAt + 30 + zip.readUInt16LE(localAt + 26)), name);
+    const dataAt = localAt + 30 + zip.readUInt16LE(localAt + 26) + zip.readUInt16LE(localAt + 28);
+    const data = zip.subarray(dataAt, dataAt + size);
+    assert.equal(crc32(data), zip.readUInt32LE(at + 16));
+    entries[name] = data.toString("utf8");
+    at += 46 + nameLength + zip.readUInt16LE(at + 30) + zip.readUInt16LE(at + 32);
+  }
+  return entries;
+}
 let streamFixture;
 let streamFixtureReady;
 
@@ -255,6 +345,34 @@ async function openTlsUpgrade({
 
 before(async () => {
   dictationStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-dictation-"));
+  coworkPromptFile = path.join(dictationStateDir, "cowork-prompt.txt");
+  fs.writeFileSync(coworkPromptFile, coworkPromptFixture, { mode: 0o600 });
+  const stateFile = path.join(dictationStateDir, "conversation-state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    conversations: [{
+      uuid: "11111111-2222-4333-8444-555555555557",
+      name: "Persisted legacy conversation",
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      nextIndex: 1,
+      leafMessageId: "11111111-2222-4333-8444-555555555558",
+      turns: [],
+      chat_messages: [{
+        uuid: "11111111-2222-4333-8444-555555555558",
+        sender: "human",
+        text: "legacy",
+        index: 0,
+        created_at: "2026-01-01T00:00:00.000Z",
+        parent_message_uuid: null,
+        files: null,
+        files_v2: null,
+        attachments: [{ file_name: "legacy.txt" }],
+        sync_sources: null,
+      }],
+    }],
+    notifications: [],
+  }));
   dictationCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-cache-"));
   const assetHost = "assets-proxy.anthropic.com";
   dictationAssetPath = "/claude-ai/v2/assets/v1/c342ae4ef-ROR3Yba4.js";
@@ -339,6 +457,7 @@ before(async () => {
   // 假上游：记录代理转发过来的 host 头与路径
   upstreamFixture = http.createServer((req, res) => {
     upstreamRequests.push({ host: req.headers.host, url: req.url });
+    if (req.url === "/upstream-failure-fixture") return req.socket.destroy();
     if (req.url.startsWith("/stream-fixture/")) {
       // 先发一段就停住，等测试放行才发完：本地服务必须边收边转，不能等整包到齐。
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": streamFixtureSize });
@@ -357,6 +476,33 @@ before(async () => {
         "x-fixture-hop": "remove-me",
       });
       return res.end(cdnAssetBody);
+    }
+    if (req.url === `/acme/tools/zip/${pluginCommit}`) {
+      res.writeHead(200, { "content-type": "application/zip" });
+      return res.end(storedZip(Object.fromEntries(
+        Object.entries(pluginFiles).map(([name, content]) => [`tools-${pluginCommit}/${name}`, content]),
+      )));
+    }
+    if (req.url === `/api/directory/plugins/${pluginFixture.id}`) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify(pluginFixture));
+    }
+    if (req.url.startsWith("/api/directory/plugins/")) {
+      res.writeHead(404, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: "not found" }));
+    }
+    if (req.url.startsWith("/api/directory/plugins?") && decodeURIComponent(req.url).includes("manifest_name == 'demo-manifest'")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ data: [pluginFixture], next_page: null, facets: {}, omitted: [] }));
+    }
+    if (req.url.startsWith("/api/directory/plugins")) {
+      if (req.url.includes("refuse=1")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "region" }));
+      }
+      // 真接口自己带 CORS 头；这里故意不带，代理必须补上。
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ data: [{ id: "plugin_fixture" }], next_page: null, facets: {}, omitted: [] }));
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, host: req.headers.host, url: req.url }));
@@ -377,8 +523,12 @@ before(async () => {
       CLAUDE_LOCAL_UPSTREAM_MAP: JSON.stringify({
         "downloads.claude.ai": `http://127.0.0.1:${upstreamFixturePort}`,
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
+        "api.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
+        "codeload.github.com": `http://127.0.0.1:${upstreamFixturePort}`,
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
+      CLAUDE_LOCAL_COWORK_PROMPT_FILE: coworkPromptFile,
+      CLAUDE_LOCAL_STATE_FILE: path.join(dictationStateDir, "conversation-state.json"),
       CODEX_PLUS_STATE_DIR: dictationStateDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -412,8 +562,10 @@ after(async () => {
   }
   if (gateway) await new Promise((resolve) => gateway.close(resolve));
   if (dictationFixture) await new Promise((resolve) => dictationFixture.close(resolve));
+  if (coworkPromptFile) fs.unlinkSync(coworkPromptFile);
   if (dictationStateDir) {
     fs.unlinkSync(path.join(dictationStateDir, "dictation-helper.json"));
+    fs.unlinkSync(path.join(dictationStateDir, "conversation-state.json"));
     fs.rmdirSync(dictationStateDir);
   }
   if (dictationCacheDir) {
@@ -556,7 +708,8 @@ test("Desktop receives the native Computer Use rollout without enabling permissi
   assert.equal(result.body.features["40173473"].value, true);
   assert.equal(result.body.features["40173473"].on, true);
   assert.equal(result.body.features["40173473"].off, false);
-  assert.deepEqual(Object.keys(result.body.features).sort(), ["1291166712", "40173473"]);
+  // 2340532315：账号插件的同步，见「plugins install from the public directory」。
+  assert.deepEqual(Object.keys(result.body.features).sort(), ["1291166712", "2340532315", "40173473"]);
   assert.equal(result.body.chicagoEnabled, undefined);
 });
 
@@ -567,6 +720,17 @@ test("Desktop exposes the separate background-mode capability without selecting 
     enabled: true, appScopedEnabled: true,
   });
   assert.equal(result.body.chicagoPreferredMode, undefined);
+});
+
+test("mock mode serves the cowork system prompt through the bootstrap and its own endpoint", async () => {
+  const endpoint = await request("/api/bootstrap/00000000-0000-4000-8000-636c61756465/system_prompts", { host: "claude.ai" });
+  assert.equal(endpoint.status, 200);
+  assert.equal(endpoint.body.cowork_system_prompt.value.prompt, coworkPromptFixture);
+  assert.equal(endpoint.body.cowork_system_prompt.source, "defaultValue");
+
+  const bootstrap = await request("/api/bootstrap", { host: "claude.ai" });
+  assert.equal(bootstrap.status, 200);
+  assert.equal(bootstrap.body.system_prompts.cowork_system_prompt.value.prompt, coworkPromptFixture);
 });
 
 test("Desktop keeps its own macOS ceiling for background mode unless forced", async () => {
@@ -725,6 +889,19 @@ test("upstream requests keep their original host instead of being rewritten to c
   assert.equal(seen.url, "/claude-code-releases/2.1.317/darwin-arm64/claude.app.tar.zst");
 });
 
+test("only the Desktop web origins can read the proxy's upstream failures across origins", async () => {
+  for (const [origin, allowed] of [["https://claude.ai", true], ["https://claude.com", true],
+    ["https://example.org", false], ["https://claude.ai.example.org", false], ["null", false], [undefined, false]]) {
+    const failure = await requestText("assets-proxy.anthropic.com", "/upstream-failure-fixture", origin ? { origin } : {});
+    assert.equal(failure.status, 502);
+    assert.equal(failure.headers["access-control-allow-origin"], allowed ? origin : undefined);
+    assert.equal(failure.headers["access-control-allow-credentials"], allowed ? "true" : undefined);
+    assert.equal(failure.headers.vary.toLowerCase(), "origin");
+    assert.equal(failure.headers["cache-control"], "no-store");
+    assert.match(failure.body, /upstream unavailable/);
+  }
+});
+
 async function openDownload(host, pathname) {
   const connect = http.request({
     hostname: "127.0.0.1", port: proxyPort, method: "CONNECT", path: `${host}:443`,
@@ -845,12 +1022,170 @@ test("model routes also rewrite the streamed message_start model", async () => {
   assert.doesNotMatch(result.body, /claude-sonnet-4-6/);
 });
 
+test("legacy persisted messages with null array fields are normalized before returning to the desktop", async () => {
+  const result = await request(
+    "/api/organizations/local/chat_conversations/11111111-2222-4333-8444-555555555557",
+    { host: "claude.ai" },
+  );
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.chat_messages[0].files, []);
+  assert.deepEqual(result.body.chat_messages[0].files_v2, []);
+  assert.deepEqual(result.body.chat_messages[0].attachments, [{ file_name: "legacy.txt" }]);
+  assert.deepEqual(result.body.chat_messages[0].sync_sources, []);
+});
+
+test("plugin installed-check returns its checked-list contract", async () => {
+  const result = await request("/api/organizations/local/library/plugins/installed_check", {
+    host: "claude.ai",
+    body: { sync: "desktop_plugins", plugins: [{ id: "example", name: "Example" }] },
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, { checked: [] });
+});
+
+test("unknown remote plugin details return the API not-found contract", async () => {
+  for (const pathname of [
+    "/api/organizations/local/plugins/example-plugin",
+    "/api/organizations/local/plugins/plugin_unknown01",
+    "/api/organizations/local/plugins/by-name/example-plugin?marketplace_name=official",
+    "/api/organizations/local/plugins/by-name/example-plugin?marketplace_name=anthropic-plugin-directory",
+  ]) {
+    const result = await request(pathname, { host: "claude.ai" });
+    assert.equal(result.status, 404);
+    assert.equal(result.body.error.details.error_code, "plugin_not_found");
+  }
+});
+
+test("plugins install from the public directory: detail, enable, download, listed, remove", async () => {
+  const org = "/api/organizations/local";
+  const get = (pathname) => request(`${org}/${pathname}`, { host: "claude.ai" });
+
+  // 详情页先在默认市场里按名字找到目录，再带着它的 id 按名字读插件。
+  const marketplace = (await get("marketplaces/list-default-marketplaces")).body.marketplaces
+    .find((entry) => entry.name === "anthropic-plugin-directory");
+  assert.equal(marketplace.is_default, true);
+  const byName = await get(`plugins/by-name/demo-manifest?marketplace_name=${marketplace.name}&marketplace_id=${marketplace.id}&partition_by=organization`);
+  assert.equal(byName.status, 200);
+  assert.equal(byName.body.id, pluginFixture.id);
+  assert.equal(byName.body.name, "demo-manifest", "前端要求 name 等于地址里的名字");
+  assert.equal(byName.body.marketplace_id, marketplace.id, "前端要求 marketplace_id 等于市场 id");
+  assert.deepEqual(byName.body.mcp_servers, {});
+  assert.equal(byName.body.display_name, "Demo Tools");
+  assert.equal(byName.body.enabled, false);
+  assert.equal(byName.body.installation_preference, "available");
+  assert.equal(byName.body.reach, "privileged", "带钩子的插件安装前要提示会在电脑上运行代码");
+  assert.deepEqual(byName.body.skills, [{ name: "demo-skill", description: "Does the demo", user_invocable: true }]);
+  assert.deepEqual(byName.body.hooks, [{ event: "SessionStart", matchers: [] }]);
+  assert.equal((await get(`plugins/${pluginFixture.id}`)).body.id, pluginFixture.id);
+  assert.deepEqual((await get(`plugins/${pluginFixture.id}/scan-status`)).body, { content_scan: null });
+  assert.equal((await get(`plugins/${pluginFixture.id}/versions?page_size=100`)).status, 404);
+
+  const enabledList = () => get("plugins/list-plugins?enabled_only=true&compact=true&limit=100&offset=0");
+  assert.deepEqual((await enabledList()).body, { plugins: [], has_more: false });
+
+  // 「添加」：网页 PUT enabled，桌面端随后读这三个接口来下载和挂载。
+  const enabled = await request(`${org}/plugins/${pluginFixture.id}/enabled`, {
+    host: "claude.ai", method: "PUT", body: { enabled: true, install_source: "browse" },
+  });
+  assert.equal(enabled.status, 200);
+  assert.equal(enabled.body.enabled, true);
+  assert.ok(Array.isArray(enabled.body.skills));
+  const [row] = (await enabledList()).body.plugins;
+  assert.equal(row.id, pluginFixture.id);
+  assert.equal(row.name, "demo-manifest");
+  assert.equal(row.marketplace_name, "anthropic-plugin-directory", "缺了市场名，桌面端会丢掉这一行");
+  assert.equal(row.updated_at, pluginFixture.updated_time);
+  assert.deepEqual((await get("plugins/enabled-state")).body.preferences, [{
+    plugin_name: "demo-manifest", marketplace_id: marketplace.id, marketplace_name: marketplace.name, enabled: true,
+  }]);
+  // 组织强制安装的那种查法始终是空的，否则桌面端会把它当成管理员下发的插件。
+  assert.deepEqual((await get("plugins/list-plugins?installation_preference=auto_install&installation_preference=required&limit=100&offset=0")).body.plugins, []);
+  const mine = (await get("library/mine?kind=plugin&limit=1000")).body.items;
+  assert.equal(mine[0].plugin.backend_id, pluginFixture.id);
+  assert.equal(mine[0].viewer.installed.enabled, true);
+  const yours = (await get(`directory/plugins?filter=${encodeURIComponent("installation.state in ['enabled', 'disabled']")}&limit=1000`)).body.data;
+  assert.equal(yours[0].id, pluginFixture.id);
+  assert.equal(yours[0].installation.state, "enabled");
+
+  // 安装包：仓库在审核过的提交上的源码，只留插件所在的子目录。
+  const zip = await requestText("claude.ai", `${org}/plugins/${pluginFixture.id}/download`);
+  assert.equal(zip.status, 200);
+  assert.deepEqual(storedZipEntries(zip.bytes), {
+    ".claude-plugin/plugin.json": '{"name":"demo"}',
+    "skills/demo-skill/SKILL.md": "# demo skill",
+  });
+  assert.equal(upstreamRequests.some((seen) => seen.host === "codeload.github.com" && seen.url === `/acme/tools/zip/${pluginCommit}`), true);
+
+  const removed = await request(`${org}/plugins/${pluginFixture.id}/enabled`, {
+    host: "claude.ai", method: "PUT", body: { enabled: false, install_source: "remove" },
+  });
+  assert.equal(removed.body.enabled, false);
+  assert.deepEqual((await enabledList()).body.plugins, []);
+  assert.deepEqual((await get("plugins/enabled-state")).body.preferences, []);
+});
+
+test("frame type catalog and plugin registry return validated list shapes", async () => {
+  const types = await request("/api/frame/types", { host: "claude.ai" });
+  assert.equal(types.status, 200);
+  assert.deepEqual(types.body.types, []);
+  const registry = await request("/api/organizations/local/plugins/registry", { host: "claude.ai" });
+  assert.equal(registry.status, 200);
+  assert.deepEqual(registry.body.data, []);
+});
+
 for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   test(`policy limits keep the object shape the desktop validator expects over ${host || "direct HTTP"}`, async () => {
     const result = await request("/api/claude_code/policy_limits", { host });
     assert.equal(result.status, 200);
     assert.deepEqual(result.body.restrictions, {});
     assert.deepEqual(result.body.compliance_taints, []);
+  });
+}
+
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`plugin directory returns an array page over ${host || "direct HTTP"}`, async () => {
+    // api.anthropic.com 上的公开目录转给真接口，另有用例。
+    const paths = ["/api/organizations/local/directory/plugins"];
+    if (host !== "api.anthropic.com") paths.push("/api/directory/plugins");
+    for (const pathname of paths) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.data, []);
+      assert.equal(result.body.next_page, null);
+      assert.deepEqual(result.body.facets, {});
+      assert.deepEqual(result.body.omitted, []);
+    }
+  });
+}
+
+test("the public plugin directory comes from Anthropic and is readable cross-origin from claude.ai", async () => {
+  const before = upstreamRequests.length;
+  const listed = await request("/api/directory/plugins?limit=24&order_by=trending", { host: "api.anthropic.com" });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.data, [{ id: "plugin_fixture" }]);
+  assert.equal(listed.headers["access-control-allow-origin"], "*");
+  assert.deepEqual(upstreamRequests.slice(before), [
+    { host: "api.anthropic.com", url: "/api/directory/plugins?limit=24&order_by=trending" },
+  ]);
+
+  // 真接口拒绝（地区限制等）时回空目录，同样要带 CORS 头：缺了页面读不到，整页报「无法加载插件」。
+  const refused = await request("/api/directory/plugins?refuse=1", { host: "api.anthropic.com" });
+  assert.equal(refused.status, 200);
+  assert.deepEqual(refused.body, { data: [], next_page: null, facets: {}, omitted: [] });
+  assert.equal(refused.headers["access-control-allow-origin"], "*");
+});
+
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`DXT extension lists return entries and total over ${host || "direct HTTP"}`, async () => {
+    for (const pathname of [
+      "/api/organizations/local/dxt/extensions",
+      "/api/organizations/local/dxt/installable_extensions",
+    ]) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.entries, []);
+      assert.equal(result.body.total, 0);
+    }
   });
 }
 
@@ -878,6 +1213,9 @@ test("chat and cowork session title endpoints generate and persist titles via ga
   );
   assert.equal(fetched.status, 200);
   assert.equal(fetched.body.name, "ok");
+  assert.deepEqual(fetched.body.settings, {});
+  assert.deepEqual(fetched.body.files, []);
+  assert.deepEqual(fetched.body.sync_sources, []);
 
   const coworkTitle = await request(
     "/api/organizations/11111111-2222-4333-8444-555555555556/dust/generate_session_title",
